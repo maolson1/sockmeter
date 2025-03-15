@@ -1001,7 +1001,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
     }
 
     if (svcmode && numpeers > 0) {
-        printf("ERROR: cannot pass both -svc and (-send or -recv).\n");
+        printf("ERROR: cannot pass both -svc and (-send or -recv or -sendrecv).\n");
         err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
