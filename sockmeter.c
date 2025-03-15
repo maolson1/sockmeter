@@ -146,7 +146,6 @@ ULONG64 sm_curtime_ms(void)
 {
     static ULONG64 sm_perf_freq = 0; // ticks/sec
     if (sm_perf_freq == 0) {
-        printf("Query perf freq\n");
         if (!QueryPerformanceFrequency((LARGE_INTEGER*)&sm_perf_freq)) {
             printf(
                 "QueryPerformanceFrequency failed with %d\n", GetLastError());
@@ -164,22 +163,24 @@ ULONG64 sm_curtime_ms(void)
 
 SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
 {
+    SM_PEER* peer = NULL;
+
     size_t hostlen = wcslen(host);
     if (hostlen > NI_MAXHOST) {
         printf("Input hostname too long\n");
-        return NULL;
+        goto exit;
     }
 
     size_t portlen = wcslen(port);
     if (portlen > NI_MAXSERV) {
         printf("Input port string too long\n");
-        return NULL;
+        goto exit;
     }
 
-    SM_PEER* peer = malloc(sizeof(SM_PEER));
+    peer = malloc(sizeof(SM_PEER));
     if (peer == NULL) {
         printf("Failed to allocate SM_PEER\n");
-        return NULL;
+        goto exit;
     }
 
     wcsncpy_s(peer->host, NI_MAXHOST * sizeof(wchar_t), host, hostlen);
@@ -189,6 +190,7 @@ SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
     peer->next = sm_peers;
     sm_peers = peer;
 
+exit:
     return peer;
 }
 
@@ -199,31 +201,47 @@ void sm_del_peer(SM_PEER* peer)
 
 SM_IO* sm_new_io(SM_DIRECTION dir)
 {
-    SM_IO* io = malloc(sizeof(SM_IO));
+    int err = NO_ERROR;
+    SM_IO* io = NULL;
+
+    io = malloc(sizeof(SM_IO));
     if (io == NULL) {
         printf("Failed to allocate SM_IO\n");
-        return NULL;
+        err = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
     }
     memset(io, 0, sizeof(*io));
+
     io->ov.hEvent = WSACreateEvent();
     if (io->ov.hEvent == WSA_INVALID_EVENT) {
-        printf("WSACreateEvent failed with %d\n", WSAGetLastError());
-        free(io);
-        return NULL;
+        err = WSAGetLastError();
+        printf("WSACreateEvent failed with %d\n", err);
+        goto exit;
     }
+
     io->dir = dir;
     io->xferred = 0;
     io->bufsize = sm_iosize;
     io->buf = malloc(io->bufsize);
     if (io->buf == NULL) {
         printf("failed to allocate IO buffer of size %d\n", io->bufsize);
-        WSACloseEvent(io->ov.hEvent);
-        free(io);
-        return NULL;
+        err = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
     }
     io->to_xfer = io->bufsize;
     io->wsabuf.buf = io->buf;
     io->wsabuf.len = io->to_xfer;
+
+exit:
+    if (err != NO_ERROR) {
+        if (io != NULL) {
+            if (io->ov.hEvent != WSA_INVALID_EVENT) {
+                WSACloseEvent(io->ov.hEvent);
+            }
+            free(io);
+            io = NULL;
+        }
+    }
     return io;
 }
 
@@ -239,34 +257,43 @@ void sm_del_io(SM_IO* io)
 SM_FLOW* sm_new_flow(
     SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir, ULONG64 to_xfer)
 {
-    SM_FLOW* flow = malloc(sizeof(SM_FLOW));
+    int err = NO_ERROR;
+    SM_FLOW* flow = NULL;
+
+    flow = malloc(sizeof(SM_FLOW));
     if (flow == NULL) {
         printf("Failed to allocate SM_FLOW\n");
-        return NULL;
+        err = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
     }
     memset(flow, 0, sizeof(*flow));
-    flow->sock = sock;
+
     if (CreateIoCompletionPort(
-            (HANDLE)flow->sock, thread->iocp, (ULONG_PTR)flow, 0) == NULL) {
-        printf("Associating sock to iocp failed with %d\n", GetLastError());
-        free(flow);
-        return NULL;
+            (HANDLE)sock, thread->iocp, (ULONG_PTR)flow, 0) == NULL) {
+        err = GetLastError();
+        printf("Associating sock to iocp failed with %d\n", err);
+        goto exit;
     }
+
     if (dir == SmDirectionSend || dir == SmDirectionBoth) {
         flow->io_tx = sm_new_io(SmDirectionSend);
         if (flow->io_tx == NULL) {
-            free(flow);
-            return NULL;
-        }
-    }
-    if (dir == SmDirectionRecv || dir == SmDirectionBoth) {
-        flow->io_rx = sm_new_io(SmDirectionRecv);
-        if (flow->io_rx == NULL) {
-            free(flow);
-            return NULL;
+            printf("Failed to create new send IO\n");
+            err = ERROR_NOT_ENOUGH_MEMORY;
+            goto exit;
         }
     }
 
+    if (dir == SmDirectionRecv || dir == SmDirectionBoth) {
+        flow->io_rx = sm_new_io(SmDirectionRecv);
+        if (flow->io_rx == NULL) {
+            printf("Failed to create new recv IO\n");
+            err = ERROR_NOT_ENOUGH_MEMORY;
+            goto exit;
+        }
+    }
+
+    flow->sock = sock;
     flow->xferred_tx = 0;
     flow->xferred_rx = 0;
     flow->to_xfer = to_xfer;
@@ -277,6 +304,19 @@ SM_FLOW* sm_new_flow(
     thread->numflows++;
     ReleaseMutex(thread->mutex);
 
+exit:
+    if (err != NO_ERROR) {
+        if (flow != NULL) {
+            if (flow->io_tx != NULL) {
+                // TODO
+            }
+            if (flow->io_rx != NULL) {
+                // TODO
+            }
+            free(flow);
+            flow = NULL;
+        }
+    }
     return flow;
 }
 
@@ -308,7 +348,10 @@ void sm_del_flow(SM_THREAD* thread, SM_FLOW* flow)
 
 SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
 {
-    SM_THREAD* thread = malloc(sizeof(SM_THREAD));
+    int err = NO_ERROR;
+    SM_THREAD* thread = NULL;
+
+    thread = malloc(sizeof(SM_THREAD));
     if (thread == NULL) {
         printf("Failed to allocate SM_THREAD\n");
         return NULL;
@@ -317,32 +360,47 @@ SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
 
     thread->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (thread->iocp == NULL) {
-        printf("CreateIoCompletionPort failed with %d\n", GetLastError());
-        free(thread);
-        return NULL;
+        err = GetLastError();
+        printf("CreateIoCompletionPort failed with %d\n", err);
+        goto exit;
     }
-    thread->numflows = 0;
-    thread->flows = NULL;
 
     thread->mutex = CreateMutex(NULL, FALSE, NULL);
     if (thread->mutex == NULL) {
-        printf("CreateMutex failed with %d\n", GetLastError());
-        CloseHandle(thread->iocp);
-        free(thread);
-        return NULL;
+        err = GetLastError();
+        printf("CreateMutex failed with %d\n", err);
+        goto exit;
     }
 
     thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
     if (thread->t == NULL) {
-        printf("CreateThread failed with %d\n", GetLastError());
-        CloseHandle(thread->mutex);
-        CloseHandle(thread->iocp);
-        free(thread);
-        return NULL;
+        err = GetLastError();
+        printf("CreateThread failed with %d\n", err);
+        goto exit;
     }
+
+    thread->numflows = 0;
+    thread->flows = NULL;
 
     thread->next = sm_threads;
     sm_threads = thread;
+
+exit:
+    if (err != NO_ERROR) {
+        if (thread != NULL) {
+            if (thread->t != NULL) {
+                CloseHandle(thread->t);
+            }
+            if (thread->mutex != NULL) {
+                CloseHandle(thread->mutex);
+            }
+            if (thread->iocp != NULL) {
+                CloseHandle(thread->iocp);
+            }
+            free(thread);
+            thread = NULL;
+        }
+    }
     return thread;
 }
 
@@ -367,7 +425,7 @@ int sm_start_flow(SM_FLOW* flow)
 {
     // Post initial IO(s), which will be subsequently reposted by sm_io_loop.
 
-    int err = 0;
+    int err = NO_ERROR;
     if (flow->io_tx != NULL) {
         if (WSASend(
                 flow->sock, &(flow->io_tx->wsabuf), 1, NULL,
@@ -375,8 +433,9 @@ int sm_start_flow(SM_FLOW* flow)
             err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
                 printf("WSASend failed with %d\n", err);
+                goto exit;
             } else {
-                err = 0;
+                err = NO_ERROR;
             }
         }
     }
@@ -389,11 +448,14 @@ int sm_start_flow(SM_FLOW* flow)
             err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
                 printf("WSARecv failed with %d\n", err);
+                goto exit;
             } else {
-                err = 0;
+                err = NO_ERROR;
             }
         }
     }
+
+exit:
     return err;
 }
 
@@ -402,7 +464,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
     // Loop on GetQueuedCompletionStatus, reposting IOs or shutting down
     // flows as appropriate.
 
-    int err = 0;
+    int err = NO_ERROR;
     int xferred;
     SM_FLOW* flow;
     SM_IO* io;
@@ -414,7 +476,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                 (LPOVERLAPPED*)&io, timeout_ms)) {
             err = GetLastError();
             printf("GetQueuedCompletionStatus failed with %d\n", err);
-            break;
+            goto exit;
         }
 
         if (sm_cleanup_time || xferred == 0) {
@@ -471,9 +533,9 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     } else {
                         printf("WSARecv failed with %d\n", err);
                     }
-                    break;
+                    goto exit;
                 } else {
-                    err = 0;
+                    err = NO_ERROR;
                 }
             }
         } else {
@@ -485,6 +547,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
         }
     }
 
+exit:
     return err;
 }
 
@@ -492,7 +555,7 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
 {
     // Create an outbound connection and an SM_FLOW for it.
 
-    int err = 0;
+    int err = NO_ERROR;
     SOCKET sock = INVALID_SOCKET;
 
     sock = WSASocket(
@@ -534,7 +597,8 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
     SM_FLOW* flow =
         sm_new_flow(thread, sock, peer->dir, sm_nbytes / sm_nsock);
     if (flow == NULL) {
-        err = 1;
+        printf("Failed to create new flow\n");
+        err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
 
@@ -580,8 +644,9 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
         err = 1;
         goto exit;
     }
+
 exit:
-    if (err != 0) {
+    if (err != NO_ERROR) {
         if (sock != INVALID_SOCKET) {
             closesocket(sock);
         }
@@ -594,10 +659,14 @@ SM_FLOW* sm_accept_flow(SOCKET ls, SM_THREAD* thread)
     // Call accept on the input listening socket, and create an SM_FLOW for
     // the resulting inbound connection.
 
+    int err = NO_ERROR;
+    SM_FLOW* flow = NULL;
+
     SOCKET ss = accept(ls, NULL, NULL);
     if (ss == INVALID_SOCKET) {
-        printf("Accept failed with %d\n", WSAGetLastError());
-        return NULL;
+        err = WSAGetLastError();
+        printf("Accept failed with %d\n", err);
+        goto exit;
     }
 
     DEVTRACE("Accepted connection\n");
@@ -605,15 +674,28 @@ SM_FLOW* sm_accept_flow(SOCKET ls, SM_THREAD* thread)
     SM_MSG_HELLO hello = {0};
     int xferred = recv(ss, (char*)&hello, sizeof(hello), MSG_WAITALL);
     if (xferred == SOCKET_ERROR) {
-        printf("recv(hello) failed with %d\n", WSAGetLastError());
-        closesocket(ss);
-        return NULL;
+        err = WSAGetLastError();
+        printf("recv(hello) failed with %d\n", err);
+        goto exit;
     }
 
-    SM_FLOW* flow = sm_new_flow(thread, ss, hello.dir, hello.to_xfer);
+    flow = sm_new_flow(thread, ss, hello.dir, hello.to_xfer);
     if (flow == NULL) {
+        err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new flow for accept socket\n");
-        closesocket(ss);
+        goto exit;
+    }
+    ss = INVALID_SOCKET; // flow owns socket now.
+
+exit:
+    if (err != NO_ERROR) {
+        if (flow != NULL) {
+            sm_del_flow(thread, flow);
+            flow = NULL;
+        }
+        if (ss != INVALID_SOCKET) {
+            closesocket(ss);
+        }
     }
     return flow;
 }
@@ -626,7 +708,7 @@ DWORD sm_service_fn(void* param)
     return 0;
 }
 
-VOID sm_service(void)
+void sm_service(void)
 {
     int err = 0;
     SOCKET ls = INVALID_SOCKET;
@@ -695,7 +777,7 @@ DWORD sm_client_fn(void* param)
     return sm_io_loop((SM_THREAD*)param, 5000);
 }
 
-VOID sm_client(void)
+void sm_client(void)
 {
     int err;
     SM_THREAD* thread;
