@@ -137,7 +137,6 @@ int sm_sbuf = -1;
 int sm_rbuf = -1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
-ULONG64 sm_perf_freq; // ticks/sec
 
 // Variables for service only:
 SOCKADDR_INET sm_svcaddr;
@@ -145,6 +144,16 @@ size_t sm_svcaddrlen;
 
 ULONG64 sm_curtime_ms(void)
 {
+    static ULONG64 sm_perf_freq = 0; // ticks/sec
+    if (sm_perf_freq == 0) {
+        printf("Query perf freq\n");
+        if (!QueryPerformanceFrequency((LARGE_INTEGER*)&sm_perf_freq)) {
+            printf(
+                "QueryPerformanceFrequency failed with %d\n", GetLastError());
+            return 0;
+        }
+    }
+
     ULONG64 ticks = 0;
     if (!QueryPerformanceCounter((LARGE_INTEGER*)&ticks)) {
         printf("QueryPerformanceCounter failed with %d\n", GetLastError());
@@ -835,12 +844,6 @@ int __cdecl wmain(int argc, wchar_t** argv)
         goto exit;
     } else if (argc == 2 && !wcscmp(argv[1], L"-v")) {
         printf("%s\n", VERSION);
-        goto exit;
-    }
-
-    if (!QueryPerformanceFrequency((LARGE_INTEGER*)&sm_perf_freq)) {
-        err = GetLastError();
-        printf("QueryPerformanceFrequency failed with %d\n", err);
         goto exit;
     }
 
