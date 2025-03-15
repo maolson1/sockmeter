@@ -48,10 +48,11 @@
 "       Run sockmeter client.\n" \
 "\n" \
 "[client_args]:\n" \
-"   -send [h] [p]: Send to host h at port p. Pass multiple times to\n" \
-"                  send data to multiple peers.\n" \
-"   -recv [h] [p]: receive from host h at port p. Pass multiple times to\n" \
-"                  receive data from multiple peers.\n" \
+"   -send [h] [p]:\n" \
+"   -recv [h] [p]:\n" \
+"   -sendrecv [h] [p]: Send/receive to/from host h at port p.\n" \
+"                  Pass multiple times to send/receive data to/from\n" \
+"                  multiple peers.\n" \
 "   -nsock [#]: number of sockets.\n" \
 "   -nthread [#]: number of threads.\n" \
 "   -nbytes [#]: Total bytes (divided between sockets).\n" \
@@ -73,7 +74,8 @@
 
 typedef enum {
     SmDirectionSend,
-    SmDirectionRecv
+    SmDirectionRecv,
+    SmDirectionBoth
 } SM_DIRECTION;
 
 #pragma pack(push,1)
@@ -104,9 +106,10 @@ typedef struct _SM_IO {
 typedef struct _SM_FLOW {
     struct _SM_FLOW* next;
     SOCKET sock;
-    SM_IO* io;
-    SM_DIRECTION dir;
-    ULONG64 xferred;
+    SM_IO* io_tx;
+    SM_IO* io_rx;
+    ULONG64 xferred_tx;
+    ULONG64 xferred_rx;
     ULONG64 to_xfer; // 0 means send indefinitely.
 } SM_FLOW;
 
@@ -240,13 +243,23 @@ SM_FLOW* sm_new_flow(
         free(flow);
         return NULL;
     }
-    flow->io = sm_new_io(dir);
-    if (flow->io == NULL) {
-        free(flow);
-        return NULL;
+    if (dir == SmDirectionSend || dir == SmDirectionBoth) {
+        flow->io_tx = sm_new_io(SmDirectionSend);
+        if (flow->io_tx == NULL) {
+            free(flow);
+            return NULL;
+        }
     }
-    flow->dir = dir;
-    flow->xferred = 0;
+    if (dir == SmDirectionRecv || dir == SmDirectionBoth) {
+        flow->io_rx = sm_new_io(SmDirectionRecv);
+        if (flow->io_rx == NULL) {
+            free(flow);
+            return NULL;
+        }
+    }
+
+    flow->xferred_tx = 0;
+    flow->xferred_rx = 0;
     flow->to_xfer = to_xfer;
 
     WaitForSingleObject(thread->mutex, INFINITE);
@@ -267,19 +280,18 @@ void sm_del_flow(SM_THREAD* thread, SM_FLOW* flow)
     }
     *f = flow->next;
     thread->numflows--;
-    if (flow->dir == SmDirectionSend) {
-        thread->xferred_tx += flow->xferred;
-    } else {
-        thread->xferred_rx += flow->xferred;
-    }
+    thread->xferred_tx += flow->xferred_tx;
+    thread->xferred_rx += flow->xferred_rx;
     ReleaseMutex(thread->mutex);
 
     if (flow->sock != INVALID_SOCKET) {
         closesocket(flow->sock);
     }
-
-    if (flow->io != NULL) {
-        sm_del_io(flow->io);
+    if (flow->io_tx != NULL) {
+        sm_del_io(flow->io_tx);
+    }
+    if (flow->io_rx != NULL) {
+        sm_del_io(flow->io_rx);
     }
 
     free(flow);
@@ -344,29 +356,33 @@ void sm_del_thread(SM_THREAD* thread)
 
 int sm_start_flow(SM_FLOW* flow)
 {
-    // Post the flow's initial IO. The IO will be subsequently reposted
-    // by sm_io_loop.
+    // Post initial IO(s), which will be subsequently reposted by sm_io_loop.
 
     int err = 0;
-    if (flow->dir == SmDirectionSend) {
-        err = WSASend(
-                flow->sock, &(flow->io->wsabuf), 1, NULL,
-                0, &(flow->io->ov), NULL);
-    } else {
-        err = WSARecv(
-                flow->sock, &(flow->io->wsabuf), 1, NULL,
-                &(flow->io->recvflags), &(flow->io->ov), NULL);
-    }
-    if (err == SOCKET_ERROR) {
-        err = WSAGetLastError();
-        if (err != WSA_IO_PENDING) {
-            if (flow->dir == SmDirectionSend) {
+    if (flow->io_tx != NULL) {
+        if (WSASend(
+                flow->sock, &(flow->io_tx->wsabuf), 1, NULL,
+                0, &(flow->io_tx->ov), NULL) == SOCKET_ERROR) {
+            err = WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
                 printf("WSASend failed with %d\n", err);
             } else {
-                printf("WSARecv failed with %d\n", err);
+                err = 0;
             }
-        } else {
-            err = 0;
+        }
+    }
+
+    if (flow->io_rx != NULL) {
+        if (WSARecv(
+                flow->sock, &(flow->io_rx->wsabuf), 1, NULL,
+                &(flow->io_rx->recvflags), &(flow->io_rx->ov), NULL)
+                    == SOCKET_ERROR) {
+            err = WSAGetLastError();
+            if (err != WSA_IO_PENDING) {
+                printf("WSARecv failed with %d\n", err);
+            } else {
+                err = 0;
+            }
         }
     }
     return err;
@@ -403,33 +419,40 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 
         // Reminder: (flow->to_xfer == 0) means send forever.
 
+        ULONG64* flow_dir_xferred;
+        if (io->dir == SmDirectionSend) {
+            flow_dir_xferred = &flow->xferred_tx;
+        } else {
+            flow_dir_xferred = &flow->xferred_rx;
+        }
+
         io->xferred += xferred;
         if (io->xferred < io->to_xfer) {
             io->wsabuf.buf = &(io->buf[io->xferred]);
             io->wsabuf.len = io->to_xfer - io->xferred;
         } else if (flow->to_xfer == 0 ||
-                   flow->to_xfer > flow->xferred + io->to_xfer) {
-            flow->xferred += io->to_xfer;
+                   flow->to_xfer > *flow_dir_xferred + io->to_xfer) {
+            *flow_dir_xferred += io->to_xfer;
             if (flow->to_xfer != 0 &&
-                io->to_xfer > (flow->to_xfer - flow->xferred)) {
-                io->to_xfer = (DWORD)(flow->to_xfer - flow->xferred);
+                io->to_xfer > (flow->to_xfer - *flow_dir_xferred)) {
+                io->to_xfer = (DWORD)(flow->to_xfer - *flow_dir_xferred);
             }
             io->wsabuf.buf = io->buf;
             io->wsabuf.len = io->to_xfer;
             io->xferred = 0;
         } else {
-            flow->xferred = flow->to_xfer;
+            *flow_dir_xferred = flow->to_xfer;
         }
 
-        if (flow->to_xfer == 0 || flow->xferred < flow->to_xfer) {
+        if (flow->to_xfer == 0 || *flow_dir_xferred < flow->to_xfer) {
             if (io->dir == SmDirectionSend) {
                 err = WSASend(
                     flow->sock, &(io->wsabuf), 1, NULL,
                     0, &(io->ov), NULL);
             } else {
                 err = WSARecv(
-                    flow->sock, &(flow->io->wsabuf), 1, NULL,
-                    &(flow->io->recvflags), &(flow->io->ov), NULL);
+                    flow->sock, &(io->wsabuf), 1, NULL,
+                    &(io->recvflags), &(io->ov), NULL);
             }
             if (err == SOCKET_ERROR) {
                 err = WSAGetLastError();
@@ -526,8 +549,17 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
 
     SM_MSG_HELLO hello = {0};
     // If we send then the service receives, and vice versa.
-    hello.dir =
-        (flow->dir == SmDirectionSend) ? SmDirectionRecv : SmDirectionSend;
+    switch (peer->dir) {
+    case SmDirectionSend:
+        hello.dir = SmDirectionRecv;
+        break;
+    case SmDirectionRecv:
+        hello.dir = SmDirectionSend;
+        break;
+    case SmDirectionBoth:
+        hello.dir = SmDirectionBoth;
+        break;
+    }
     hello.to_xfer = flow->to_xfer;
     int bytes_sent = send(flow->sock, (char*)&hello, sizeof(hello), 0);
     if (bytes_sent == SOCKET_ERROR) {
@@ -765,11 +797,8 @@ VOID sm_client(void)
             xferred_rx += thread->xferred_rx;
             flow = thread->flows;
             while (flow != NULL) {
-                if (flow->dir == SmDirectionSend) {
-                    xferred_tx += flow->xferred;
-                } else {
-                    xferred_rx += flow->xferred;
-                }
+                xferred_tx += flow->xferred_tx;
+                xferred_rx += flow->xferred_rx;
                 flow = flow->next;
             }
             ReleaseMutex(thread->mutex);
@@ -856,10 +885,6 @@ int __cdecl wmain(int argc, wchar_t** argv)
             sm_iosize = _wtoi(*av);
             av++; ac++;
         } else if (argsleft >= 2 && !wcscmp(*name, L"-send")) {
-            if (svcmode) {
-                err = ERROR_INVALID_PARAMETER;
-                goto exit;
-            }
             if (sm_new_peer(*av, *(av + 1), SmDirectionSend) == NULL) {
                 printf("Failed to parse \"-send %ls %ls\"\n", *av, *(av + 1));
                 err = ERROR_INVALID_PARAMETER;
@@ -870,6 +895,14 @@ int __cdecl wmain(int argc, wchar_t** argv)
         } else if (argsleft >= 2 && !wcscmp(*name, L"-recv")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionRecv) == NULL) {
                 printf("Failed to parse \"-recv %ls %ls\"\n", *av, *(av + 1));
+                err = ERROR_INVALID_PARAMETER;
+                goto exit;
+            }
+            numpeers++;
+            av += 2; ac += 2;
+        } else if (argsleft >= 2 && !wcscmp(*name, L"-sendrecv")) {
+            if (sm_new_peer(*av, *(av + 1), SmDirectionBoth) == NULL) {
+                printf("Failed to parse \"-sendrecv %ls %ls\"\n", *av, *(av + 1));
                 err = ERROR_INVALID_PARAMETER;
                 goto exit;
             }
