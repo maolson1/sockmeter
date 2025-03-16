@@ -22,6 +22,7 @@
 //       SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
 // TODO: Less alarming messages for ungraceful connection closure on service
 //       side (or perhaps do graceful connection closure).
+// TODO: -v4 and -v6 cmdline arg to force v4/6 when using hostnames
 
 #define WIN32_LEAN_AND_MEAN 1
 #include <windows.h>
@@ -31,6 +32,7 @@
 #include <winsock2.h>
 #include <mswsock.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
 #include <iphlpapi.h>
 
 #define VERSION "0.0.0"
@@ -87,8 +89,8 @@ typedef struct {
 
 typedef struct _SM_PEER {
     struct _SM_PEER* next;
-    wchar_t host[NI_MAXHOST];
-    wchar_t port[NI_MAXSERV];
+    SOCKADDR_INET addr;
+    int addrlen;
     SM_DIRECTION dir;
 } SM_PEER;
 
@@ -165,20 +167,8 @@ SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
 {
     int err = NO_ERROR;
     SM_PEER* peer = NULL;
-
-    size_t hostlen = wcslen(host);
-    if (hostlen > NI_MAXHOST) {
-        printf("Input hostname too long\n");
-        err = ERROR_INVALID_PARAMETER;
-        goto exit;
-    }
-
-    size_t portlen = wcslen(port);
-    if (portlen > NI_MAXSERV) {
-        printf("Input port string too long\n");
-        err = ERROR_INVALID_PARAMETER;
-        goto exit;
-    }
+    ADDRINFOW hints = {0};
+    ADDRINFOW* res = NULL;
 
     peer = malloc(sizeof(SM_PEER));
     if (peer == NULL) {
@@ -186,9 +176,26 @@ SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
+    memset(peer, 0, sizeof(*peer));
 
-    wcsncpy_s(peer->host, NI_MAXHOST * sizeof(wchar_t), host, hostlen);
-    wcsncpy_s(peer->port, NI_MAXSERV * sizeof(wchar_t), port, portlen);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (GetAddrInfoW(host, port, &hints, &res) != 0) {
+        err = WSAGetLastError();
+        printf("GetAddrInfoW failed: %d\n", err);
+        goto exit;
+    }
+
+    if (res->ai_addr->sa_family == AF_INET) {
+        SCOPE_ID scope = {0};
+        SOCKADDR_IN* sa4 = (SOCKADDR_IN*)res->ai_addr;
+        IN6ADDR_SETV4MAPPED(
+            (SOCKADDR_IN6*)&peer->addr, &sa4->sin_addr, scope, sa4->sin_port);
+    } else {
+        memcpy((SOCKADDR*)&peer->addr, res->ai_addr, res->ai_addrlen);
+    }
+    peer->addrlen = sizeof(SOCKADDR_IN6);
+
     peer->dir = dir;
 
     peer->next = sm_peers;
@@ -200,6 +207,9 @@ exit:
             free(peer);
             peer = NULL;
         }
+    }
+    if (res != NULL) {
+        FreeAddrInfoW(res);
     }
     return peer;
 }
@@ -619,21 +629,10 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         goto exit;
     }
 
-    SOCKADDR_INET laddr = {0};
-    DWORD laddrlen = sizeof(laddr);
-    SOCKADDR_INET raddr = {0};
-    DWORD raddrlen = sizeof(raddr);
-    if (!WSAConnectByNameW(
-            conn->sock, peer->host, peer->port, &laddrlen, (SOCKADDR*)&laddr,
-            &raddrlen, (SOCKADDR*)&raddr, NULL, NULL)) {
-        err = WSAGetLastError();
-        printf("WSAConnectByNameW failed with %d\n", err);
-        goto exit;
-    }
-    if (setsockopt(conn->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0)
+    if (connect(conn->sock, (SOCKADDR*)&peer->addr, peer->addrlen)
             == SOCKET_ERROR) {
         err = WSAGetLastError();
-        printf("setsockopt(SO_UPDATE_CONNECT_CONTEXT) failed with %d\n", err);
+        printf("connect failed with %d\n", err);
         goto exit;
     }
 
@@ -842,19 +841,7 @@ void sm_client(void)
 
     printf("Testing...\n");
 
-    // The datapath is optimized, but connection establishment is not:
-    // we call WSAConnectByName serially, which means potentially a lot of
-    // unnecessary name lookups and multiple syscalls to connect and send the
-    // HELLO, which ConnectEx could do in a single syscall.
-    //
-    // Also, if some of the connections experienced dropped SYN segments, they
-    // will see major delays due to the large retransmission period of SYNs.
-    // if we included that delay in our rate calculation, it could cause
-    // confusing noise.
-    //
-    // So, we don't start timing until the connections are all established.
-    // Benchmarking "connections per second" as opposed to "bytes per second"
-    // is future work.
+    // TODO: consider including connection establishment in the timing.
 
     ULONG64 t_start_ms = sm_curtime_ms();
 
