@@ -18,7 +18,7 @@
 // TODO: Should -nbytes be per-socket or across all sockets?
 // TODO: Currently the service side thread count is min(64, numProc).
 //       Consider creating a number of threads equal to the number of
-//       RSS processors and assigning flows to threads based on the output of
+//       RSS processors and assigning conns to threads based on the output of
 //       SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
 // TODO: Less alarming messages for ungraceful connection closure on service
 //       side (or perhaps do graceful connection closure).
@@ -103,25 +103,25 @@ typedef struct _SM_IO {
     int bufsize;
 } SM_IO;
 
-typedef struct _SM_FLOW {
-    struct _SM_FLOW* next;
+typedef struct _SM_CONN {
+    struct _SM_CONN* next;
     SOCKET sock;
     SM_IO* io_tx;
     SM_IO* io_rx;
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
     ULONG64 to_xfer; // 0 means send indefinitely.
-} SM_FLOW;
+} SM_CONN;
 
 typedef struct _SM_THREAD {
     struct _SM_THREAD* next;
     HANDLE t;
     HANDLE iocp;
     CRITICAL_SECTION lock;
-    ULONG64 xferred_tx; // sum of bytes tx'd by deleted flows.
-    ULONG64 xferred_rx; // sum of bytes rx'd by deleted flows.
-    SM_FLOW* flows;
-    ULONG numflows;
+    ULONG64 xferred_tx; // sum of bytes tx'd by deleted conns.
+    ULONG64 xferred_rx; // sum of bytes rx'd by deleted conns.
+    SM_CONN* conns;
+    ULONG numconns;
 } SM_THREAD;
 
 // Variables for client and service:
@@ -254,30 +254,30 @@ void sm_del_io(SM_IO* io)
     free(io);
 }
 
-SM_FLOW* sm_new_flow(
+SM_CONN* sm_new_conn(
     SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir, ULONG64 to_xfer)
 {
     int err = NO_ERROR;
-    SM_FLOW* flow = NULL;
+    SM_CONN* conn = NULL;
 
-    flow = malloc(sizeof(SM_FLOW));
-    if (flow == NULL) {
-        printf("Failed to allocate SM_FLOW\n");
+    conn = malloc(sizeof(SM_CONN));
+    if (conn == NULL) {
+        printf("Failed to allocate SM_CONN\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
-    memset(flow, 0, sizeof(*flow));
+    memset(conn, 0, sizeof(*conn));
 
     if (CreateIoCompletionPort(
-            (HANDLE)sock, thread->iocp, (ULONG_PTR)flow, 0) == NULL) {
+            (HANDLE)sock, thread->iocp, (ULONG_PTR)conn, 0) == NULL) {
         err = GetLastError();
         printf("Associating sock to iocp failed with %d\n", err);
         goto exit;
     }
 
     if (dir == SmDirectionSend || dir == SmDirectionBoth) {
-        flow->io_tx = sm_new_io(SmDirectionSend);
-        if (flow->io_tx == NULL) {
+        conn->io_tx = sm_new_io(SmDirectionSend);
+        if (conn->io_tx == NULL) {
             printf("Failed to create new send IO\n");
             err = ERROR_NOT_ENOUGH_MEMORY;
             goto exit;
@@ -285,65 +285,65 @@ SM_FLOW* sm_new_flow(
     }
 
     if (dir == SmDirectionRecv || dir == SmDirectionBoth) {
-        flow->io_rx = sm_new_io(SmDirectionRecv);
-        if (flow->io_rx == NULL) {
+        conn->io_rx = sm_new_io(SmDirectionRecv);
+        if (conn->io_rx == NULL) {
             printf("Failed to create new recv IO\n");
             err = ERROR_NOT_ENOUGH_MEMORY;
             goto exit;
         }
     }
 
-    flow->sock = sock;
-    flow->xferred_tx = 0;
-    flow->xferred_rx = 0;
-    flow->to_xfer = to_xfer;
+    conn->sock = sock;
+    conn->xferred_tx = 0;
+    conn->xferred_rx = 0;
+    conn->to_xfer = to_xfer;
 
     EnterCriticalSection(&thread->lock);
-    flow->next = thread->flows;
-    thread->flows = flow;
-    thread->numflows++;
+    conn->next = thread->conns;
+    thread->conns = conn;
+    thread->numconns++;
     LeaveCriticalSection(&thread->lock);
 
 exit:
     if (err != NO_ERROR) {
-        if (flow != NULL) {
-            if (flow->io_tx != NULL) {
+        if (conn != NULL) {
+            if (conn->io_tx != NULL) {
                 // TODO
             }
-            if (flow->io_rx != NULL) {
+            if (conn->io_rx != NULL) {
                 // TODO
             }
-            free(flow);
-            flow = NULL;
+            free(conn);
+            conn = NULL;
         }
     }
-    return flow;
+    return conn;
 }
 
-void sm_del_flow(SM_THREAD* thread, SM_FLOW* flow)
+void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
 {
     EnterCriticalSection(&thread->lock);
-    SM_FLOW** f = &(thread->flows);
-    while (*f != flow) {
+    SM_CONN** f = &(thread->conns);
+    while (*f != conn) {
         f = &((*f)->next);
     }
-    *f = flow->next;
-    thread->numflows--;
-    thread->xferred_tx += flow->xferred_tx;
-    thread->xferred_rx += flow->xferred_rx;
+    *f = conn->next;
+    thread->numconns--;
+    thread->xferred_tx += conn->xferred_tx;
+    thread->xferred_rx += conn->xferred_rx;
     LeaveCriticalSection(&thread->lock);
 
-    if (flow->sock != INVALID_SOCKET) {
-        closesocket(flow->sock);
+    if (conn->sock != INVALID_SOCKET) {
+        closesocket(conn->sock);
     }
-    if (flow->io_tx != NULL) {
-        sm_del_io(flow->io_tx);
+    if (conn->io_tx != NULL) {
+        sm_del_io(conn->io_tx);
     }
-    if (flow->io_rx != NULL) {
-        sm_del_io(flow->io_rx);
+    if (conn->io_rx != NULL) {
+        sm_del_io(conn->io_rx);
     }
 
-    free(flow);
+    free(conn);
 }
 
 SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
@@ -366,8 +366,8 @@ SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
     }
 
     InitializeCriticalSection(&thread->lock);
-    thread->numflows = 0;
-    thread->flows = NULL;
+    thread->numconns = 0;
+    thread->conns = NULL;
 
     thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
     if (thread->t == NULL) {
@@ -400,10 +400,10 @@ void sm_del_thread(SM_THREAD* thread)
     // This is called from the main thread on termination, and we assume
     // the SM_THREAD's thread is already terminated.
 
-    // Normally flows are deleted as they finish, but in error conditions
-    // we may terminate early and still have some flows to delete here.
-    while (thread->flows != NULL) {
-        sm_del_flow(thread, thread->flows);
+    // Normally conns are deleted as they finish, but in error conditions
+    // we may terminate early and still have some conns to delete here.
+    while (thread->conns != NULL) {
+        sm_del_conn(thread, thread->conns);
     }
 
     CloseHandle(thread->t);
@@ -411,15 +411,15 @@ void sm_del_thread(SM_THREAD* thread)
     free(thread);
 }
 
-int sm_start_flow(SM_FLOW* flow)
+int sm_start_conn(SM_CONN* conn)
 {
     // Post initial IO(s), which will be subsequently reposted by sm_io_loop.
 
     int err = NO_ERROR;
-    if (flow->io_tx != NULL) {
+    if (conn->io_tx != NULL) {
         if (WSASend(
-                flow->sock, &(flow->io_tx->wsabuf), 1, NULL,
-                0, &(flow->io_tx->ov), NULL) == SOCKET_ERROR) {
+                conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
+                0, &(conn->io_tx->ov), NULL) == SOCKET_ERROR) {
             err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
                 printf("WSASend failed with %d\n", err);
@@ -430,10 +430,10 @@ int sm_start_flow(SM_FLOW* flow)
         }
     }
 
-    if (flow->io_rx != NULL) {
+    if (conn->io_rx != NULL) {
         if (WSARecv(
-                flow->sock, &(flow->io_rx->wsabuf), 1, NULL,
-                &(flow->io_rx->recvflags), &(flow->io_rx->ov), NULL)
+                conn->sock, &(conn->io_rx->wsabuf), 1, NULL,
+                &(conn->io_rx->recvflags), &(conn->io_rx->ov), NULL)
                     == SOCKET_ERROR) {
             err = WSAGetLastError();
             if (err != WSA_IO_PENDING) {
@@ -452,17 +452,17 @@ exit:
 int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 {
     // Loop on GetQueuedCompletionStatus, reposting IOs or shutting down
-    // flows as appropriate.
+    // conns as appropriate.
 
     int err = NO_ERROR;
     int xferred;
-    SM_FLOW* flow;
+    SM_CONN* conn;
     SM_IO* io;
 
     while (TRUE) {
 
         if (!GetQueuedCompletionStatus(
-                thread->iocp, (DWORD*)&xferred, (ULONG_PTR*)&flow,
+                thread->iocp, (DWORD*)&xferred, (ULONG_PTR*)&conn,
                 (LPOVERLAPPED*)&io, timeout_ms)) {
             err = GetLastError();
             printf("GetQueuedCompletionStatus failed with %d\n", err);
@@ -478,41 +478,41 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
         // we want to resend the IO from the beginning, or we are near the end
         // of the stream and want to send only part of the IO.
 
-        // Reminder: (flow->to_xfer == 0) means send forever.
+        // Reminder: (conn->to_xfer == 0) means send forever.
 
-        ULONG64* flow_dir_xferred;
+        ULONG64* conn_dir_xferred;
         if (io->dir == SmDirectionSend) {
-            flow_dir_xferred = &flow->xferred_tx;
+            conn_dir_xferred = &conn->xferred_tx;
         } else {
-            flow_dir_xferred = &flow->xferred_rx;
+            conn_dir_xferred = &conn->xferred_rx;
         }
 
         io->xferred += xferred;
         if (io->xferred < io->to_xfer) {
             io->wsabuf.buf = &(io->buf[io->xferred]);
             io->wsabuf.len = io->to_xfer - io->xferred;
-        } else if (flow->to_xfer == 0 ||
-                   flow->to_xfer > *flow_dir_xferred + io->to_xfer) {
-            *flow_dir_xferred += io->to_xfer;
-            if (flow->to_xfer != 0 &&
-                io->to_xfer > (flow->to_xfer - *flow_dir_xferred)) {
-                io->to_xfer = (DWORD)(flow->to_xfer - *flow_dir_xferred);
+        } else if (conn->to_xfer == 0 ||
+                   conn->to_xfer > *conn_dir_xferred + io->to_xfer) {
+            *conn_dir_xferred += io->to_xfer;
+            if (conn->to_xfer != 0 &&
+                io->to_xfer > (conn->to_xfer - *conn_dir_xferred)) {
+                io->to_xfer = (DWORD)(conn->to_xfer - *conn_dir_xferred);
             }
             io->wsabuf.buf = io->buf;
             io->wsabuf.len = io->to_xfer;
             io->xferred = 0;
         } else {
-            *flow_dir_xferred = flow->to_xfer;
+            *conn_dir_xferred = conn->to_xfer;
         }
 
-        if (flow->to_xfer == 0 || *flow_dir_xferred < flow->to_xfer) {
+        if (conn->to_xfer == 0 || *conn_dir_xferred < conn->to_xfer) {
             if (io->dir == SmDirectionSend) {
                 err = WSASend(
-                    flow->sock, &(io->wsabuf), 1, NULL,
+                    conn->sock, &(io->wsabuf), 1, NULL,
                     0, &(io->ov), NULL);
             } else {
                 err = WSARecv(
-                    flow->sock, &(io->wsabuf), 1, NULL,
+                    conn->sock, &(io->wsabuf), 1, NULL,
                     &(io->recvflags), &(io->ov), NULL);
             }
             if (err == SOCKET_ERROR) {
@@ -529,9 +529,9 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                 }
             }
         } else {
-            shutdown(flow->sock, SD_BOTH);
-            sm_del_flow(thread, flow);
-            if (thread->numflows == 0) {
+            shutdown(conn->sock, SD_BOTH);
+            sm_del_conn(thread, conn);
+            if (thread->numconns == 0) {
                 break;
             }
         }
@@ -541,9 +541,9 @@ exit:
     return err;
 }
 
-int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
+int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
 {
-    // Create an outbound connection and an SM_FLOW for it.
+    // Create an outbound connection and an SM_CONN for it.
 
     int err = NO_ERROR;
     SOCKET sock = INVALID_SOCKET;
@@ -584,10 +584,10 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
         }
     }
 
-    SM_FLOW* flow =
-        sm_new_flow(thread, sock, peer->dir, sm_nbytes / sm_nsock);
-    if (flow == NULL) {
-        printf("Failed to create new flow\n");
+    SM_CONN* conn =
+        sm_new_conn(thread, sock, peer->dir, sm_nbytes / sm_nsock);
+    if (conn == NULL) {
+        printf("Failed to create new conn\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
@@ -597,13 +597,13 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
     SOCKADDR_INET raddr = {0};
     DWORD raddrlen = sizeof(raddr);
     if (!WSAConnectByNameW(
-            flow->sock, peer->host, peer->port, &laddrlen, (SOCKADDR*)&laddr,
+            conn->sock, peer->host, peer->port, &laddrlen, (SOCKADDR*)&laddr,
             &raddrlen, (SOCKADDR*)&raddr, NULL, NULL)) {
         err = WSAGetLastError();
         printf("WSAConnectByNameW failed with %d\n", err);
         goto exit;
     }
-    if (setsockopt(flow->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0)
+    if (setsockopt(conn->sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0)
             == SOCKET_ERROR) {
         err = WSAGetLastError();
         printf("setsockopt(SO_UPDATE_CONNECT_CONTEXT) failed with %d\n", err);
@@ -623,8 +623,8 @@ int sm_connect_flow(SM_THREAD* thread, SM_PEER* peer)
         hello.dir = SmDirectionBoth;
         break;
     }
-    hello.to_xfer = flow->to_xfer;
-    int bytes_sent = send(flow->sock, (char*)&hello, sizeof(hello), 0);
+    hello.to_xfer = conn->to_xfer;
+    int bytes_sent = send(conn->sock, (char*)&hello, sizeof(hello), 0);
     if (bytes_sent == SOCKET_ERROR) {
         err = WSAGetLastError();
         printf("send (hello) failed with %d\n", err);
@@ -644,13 +644,13 @@ exit:
     return err;
 }
 
-SM_FLOW* sm_accept_flow(SOCKET ls, SM_THREAD* thread)
+SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 {
-    // Call accept on the input listening socket, and create an SM_FLOW for
+    // Call accept on the input listening socket, and create an SM_CONN for
     // the resulting inbound connection.
 
     int err = NO_ERROR;
-    SM_FLOW* flow = NULL;
+    SM_CONN* conn = NULL;
 
     SOCKET ss = accept(ls, NULL, NULL);
     if (ss == INVALID_SOCKET) {
@@ -669,25 +669,25 @@ SM_FLOW* sm_accept_flow(SOCKET ls, SM_THREAD* thread)
         goto exit;
     }
 
-    flow = sm_new_flow(thread, ss, hello.dir, hello.to_xfer);
-    if (flow == NULL) {
+    conn = sm_new_conn(thread, ss, hello.dir, hello.to_xfer);
+    if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
-        printf("Failed to create new flow for accept socket\n");
+        printf("Failed to create new conn for accept socket\n");
         goto exit;
     }
-    ss = INVALID_SOCKET; // flow owns socket now.
+    ss = INVALID_SOCKET; // conn owns socket now.
 
 exit:
     if (err != NO_ERROR) {
-        if (flow != NULL) {
-            sm_del_flow(thread, flow);
-            flow = NULL;
+        if (conn != NULL) {
+            sm_del_conn(thread, conn);
+            conn = NULL;
         }
         if (ss != INVALID_SOCKET) {
             closesocket(ss);
         }
     }
-    return flow;
+    return conn;
 }
 
 DWORD sm_service_fn(void* param)
@@ -742,8 +742,8 @@ void sm_service(void)
 
     thread = sm_threads;
     while (TRUE) {
-        SM_FLOW* flow = sm_accept_flow(ls, thread);
-        if (flow == NULL) {
+        SM_CONN* conn = sm_accept_conn(ls, thread);
+        if (conn == NULL) {
             goto exit;
         }
         thread = thread->next;
@@ -751,7 +751,7 @@ void sm_service(void)
             thread = sm_threads;
         }
 
-        err = sm_start_flow(flow);
+        err = sm_start_conn(conn);
         if (err != 0) {
             goto exit;
         }
@@ -772,7 +772,7 @@ void sm_client(void)
     int err;
     SM_THREAD* thread;
     SM_PEER* peer;
-    SM_FLOW* flow;
+    SM_CONN* conn;
 
     for (int i = 0; i < sm_nthread; i++) {
         thread = sm_new_thread(sm_client_fn);
@@ -783,22 +783,22 @@ void sm_client(void)
 
     printf("Connecting...\n");
 
-    // Assign flows to threads and peers round-robin.
+    // Assign conns to threads and peers round-robin.
     //
-    // We first connect all flows and then start all flows, rather than
-    // starting each flow as it's connected. This is for two reasons:
+    // We first connect all conns and then start all conns, rather than
+    // starting each conn as it's connected. This is for two reasons:
     // 1) If we fail to connect to one of multiple peers, we will abort and
     //    it's better not to have started transferring data with the other
     //    peers.
-    // 2) This makes synchronization in sm_io_loop easier- we add all the flows
-    //    to the thread so that "numflows" is a complete count, and only then
-    //    do we post the IOs, so we won't have a race where numflows drops
-    //    back to zero before we've added all of the flows.
+    // 2) This makes synchronization in sm_io_loop easier- we add all the conns
+    //    to the thread so that "numconns" is a complete count, and only then
+    //    do we post the IOs, so we won't have a race where numconns drops
+    //    back to zero before we've added all of the conns.
 
     thread = sm_threads;
     peer = sm_peers;
     for (int i = 0; i < sm_nsock; i++) {
-        err = sm_connect_flow(thread, peer);
+        err = sm_connect_conn(thread, peer);
         if (err != 0) {
             return;
         }
@@ -833,14 +833,14 @@ void sm_client(void)
     thread = sm_threads;
     while (thread != NULL) {
         EnterCriticalSection(&thread->lock);
-        flow = thread->flows;
-        while (flow != NULL) {
-            err = sm_start_flow(flow);
+        conn = thread->conns;
+        while (conn != NULL) {
+            err = sm_start_conn(conn);
             if (err != 0) {
                 LeaveCriticalSection(&thread->lock);
                 return;
             }
-            flow = flow->next;
+            conn = conn->next;
         }
         LeaveCriticalSection(&thread->lock);
         thread = thread->next;
@@ -869,18 +869,18 @@ void sm_client(void)
         ULONG64 xferred_rx = 0;
         thread = sm_threads;
         while (thread != NULL) {
-            // Depending on whether we're in -t or -nbytes mode, the flows
+            // Depending on whether we're in -t or -nbytes mode, the conns
             // may or may not have been deleted at this point. So add the
-            // thread's count of bytes xferred by deleted flows to the
-            // counts in any active flows.
+            // thread's count of bytes xferred by deleted conns to the
+            // counts in any active conns.
             EnterCriticalSection(&thread->lock);
             xferred_tx += thread->xferred_tx;
             xferred_rx += thread->xferred_rx;
-            flow = thread->flows;
-            while (flow != NULL) {
-                xferred_tx += flow->xferred_tx;
-                xferred_rx += flow->xferred_rx;
-                flow = flow->next;
+            conn = thread->conns;
+            while (conn != NULL) {
+                xferred_tx += conn->xferred_tx;
+                xferred_rx += conn->xferred_rx;
+                conn = conn->next;
             }
             LeaveCriticalSection(&thread->lock);
             thread = thread->next;
