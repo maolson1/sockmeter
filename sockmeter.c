@@ -308,10 +308,10 @@ exit:
     if (err != NO_ERROR) {
         if (conn != NULL) {
             if (conn->io_tx != NULL) {
-                // TODO
+                sm_del_io(conn->io_tx);
             }
             if (conn->io_rx != NULL) {
-                // TODO
+                sm_del_io(conn->io_rx);
             }
             free(conn);
             conn = NULL;
@@ -555,6 +555,7 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         printf("socket failed with %d\n", err);
         goto exit;
     }
+
     int opt = 0;
     if (setsockopt(
             sock, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&opt, sizeof(opt))
@@ -756,6 +757,7 @@ void sm_service(void)
             goto exit;
         }
     }
+
 exit:
     if (ls != INVALID_SOCKET) {
         closesocket(ls);
@@ -1053,7 +1055,6 @@ int __cdecl wmain(int argc, wchar_t** argv)
     }
 
 exit:
-
     SM_THREAD* thread = sm_threads;
     while (thread != NULL) {
         SM_THREAD* next = thread->next;
