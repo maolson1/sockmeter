@@ -117,7 +117,7 @@ typedef struct _SM_THREAD {
     struct _SM_THREAD* next;
     HANDLE t;
     HANDLE iocp;
-    HANDLE mutex;
+    CRITICAL_SECTION lock;
     ULONG64 xferred_tx; // sum of bytes tx'd by deleted flows.
     ULONG64 xferred_rx; // sum of bytes rx'd by deleted flows.
     SM_FLOW* flows;
@@ -298,11 +298,11 @@ SM_FLOW* sm_new_flow(
     flow->xferred_rx = 0;
     flow->to_xfer = to_xfer;
 
-    WaitForSingleObject(thread->mutex, INFINITE);
+    EnterCriticalSection(&thread->lock);
     flow->next = thread->flows;
     thread->flows = flow;
     thread->numflows++;
-    ReleaseMutex(thread->mutex);
+    LeaveCriticalSection(&thread->lock);
 
 exit:
     if (err != NO_ERROR) {
@@ -322,7 +322,7 @@ exit:
 
 void sm_del_flow(SM_THREAD* thread, SM_FLOW* flow)
 {
-    WaitForSingleObject(thread->mutex, INFINITE);
+    EnterCriticalSection(&thread->lock);
     SM_FLOW** f = &(thread->flows);
     while (*f != flow) {
         f = &((*f)->next);
@@ -331,7 +331,7 @@ void sm_del_flow(SM_THREAD* thread, SM_FLOW* flow)
     thread->numflows--;
     thread->xferred_tx += flow->xferred_tx;
     thread->xferred_rx += flow->xferred_rx;
-    ReleaseMutex(thread->mutex);
+    LeaveCriticalSection(&thread->lock);
 
     if (flow->sock != INVALID_SOCKET) {
         closesocket(flow->sock);
@@ -365,12 +365,9 @@ SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
         goto exit;
     }
 
-    thread->mutex = CreateMutex(NULL, FALSE, NULL);
-    if (thread->mutex == NULL) {
-        err = GetLastError();
-        printf("CreateMutex failed with %d\n", err);
-        goto exit;
-    }
+    InitializeCriticalSection(&thread->lock);
+    thread->numflows = 0;
+    thread->flows = NULL;
 
     thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
     if (thread->t == NULL) {
@@ -378,9 +375,6 @@ SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
         printf("CreateThread failed with %d\n", err);
         goto exit;
     }
-
-    thread->numflows = 0;
-    thread->flows = NULL;
 
     thread->next = sm_threads;
     sm_threads = thread;
@@ -390,9 +384,6 @@ exit:
         if (thread != NULL) {
             if (thread->t != NULL) {
                 CloseHandle(thread->t);
-            }
-            if (thread->mutex != NULL) {
-                CloseHandle(thread->mutex);
             }
             if (thread->iocp != NULL) {
                 CloseHandle(thread->iocp);
@@ -417,7 +408,6 @@ void sm_del_thread(SM_THREAD* thread)
 
     CloseHandle(thread->t);
     CloseHandle(thread->iocp);
-    CloseHandle(thread->mutex);
     free(thread);
 }
 
@@ -842,17 +832,17 @@ void sm_client(void)
 
     thread = sm_threads;
     while (thread != NULL) {
-        WaitForSingleObject(thread->mutex, INFINITE);
+        EnterCriticalSection(&thread->lock);
         flow = thread->flows;
         while (flow != NULL) {
             err = sm_start_flow(flow);
             if (err != 0) {
-                ReleaseMutex(thread->mutex);
+                LeaveCriticalSection(&thread->lock);
                 return;
             }
             flow = flow->next;
         }
-        ReleaseMutex(thread->mutex);
+        LeaveCriticalSection(&thread->lock);
         thread = thread->next;
     }
 
@@ -883,7 +873,7 @@ void sm_client(void)
             // may or may not have been deleted at this point. So add the
             // thread's count of bytes xferred by deleted flows to the
             // counts in any active flows.
-            WaitForSingleObject(thread->mutex, INFINITE);
+            EnterCriticalSection(&thread->lock);
             xferred_tx += thread->xferred_tx;
             xferred_rx += thread->xferred_rx;
             flow = thread->flows;
@@ -892,7 +882,7 @@ void sm_client(void)
                 xferred_rx += flow->xferred_rx;
                 flow = flow->next;
             }
-            ReleaseMutex(thread->mutex);
+            LeaveCriticalSection(&thread->lock);
             thread = thread->next;
         }
         printf(
