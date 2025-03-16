@@ -110,7 +110,7 @@ typedef struct _SM_CONN {
     SM_IO* io_rx;
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
-    ULONG64 to_xfer; // 0 means send indefinitely.
+    ULONG64 to_xfer; // 0 means transfer indefinitely.
 } SM_CONN;
 
 typedef struct _SM_THREAD {
@@ -124,7 +124,7 @@ typedef struct _SM_THREAD {
     ULONG numconns;
 } SM_THREAD;
 
-// Variables for client and service:
+// Variables for both client and service:
 SM_THREAD* sm_threads;
 int sm_iosize = 65535;
 
@@ -163,23 +163,27 @@ ULONG64 sm_curtime_ms(void)
 
 SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
 {
+    int err = NO_ERROR;
     SM_PEER* peer = NULL;
 
     size_t hostlen = wcslen(host);
     if (hostlen > NI_MAXHOST) {
         printf("Input hostname too long\n");
+        err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
 
     size_t portlen = wcslen(port);
     if (portlen > NI_MAXSERV) {
         printf("Input port string too long\n");
+        err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
 
     peer = malloc(sizeof(SM_PEER));
     if (peer == NULL) {
         printf("Failed to allocate SM_PEER\n");
+        err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
 
@@ -191,11 +195,23 @@ SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
     sm_peers = peer;
 
 exit:
+    if (err != NO_ERROR) {
+        if (peer != NULL) {
+            free(peer);
+            peer = NULL;
+        }
+    }
     return peer;
 }
 
 void sm_del_peer(SM_PEER* peer)
 {
+    SM_PEER** p = &sm_peers;
+    while (*p != peer) {
+        p = &((*p)->next);
+    }
+    *p = peer->next;
+
     free(peer);
 }
 
@@ -323,11 +339,11 @@ exit:
 void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
 {
     EnterCriticalSection(&thread->lock);
-    SM_CONN** f = &(thread->conns);
-    while (*f != conn) {
-        f = &((*f)->next);
+    SM_CONN** c = &(thread->conns);
+    while (*c != conn) {
+        c = &((*c)->next);
     }
-    *f = conn->next;
+    *c = conn->next;
     thread->numconns--;
     thread->xferred_tx += conn->xferred_tx;
     thread->xferred_rx += conn->xferred_rx;
@@ -400,6 +416,12 @@ void sm_del_thread(SM_THREAD* thread)
     // This is called from the main thread on termination, and we assume
     // the SM_THREAD's thread is already terminated.
 
+    SM_THREAD** t = &sm_threads;
+    while (*t != thread) {
+        t = &((*t)->next);
+    }
+    *t = thread->next;
+
     // Normally conns are deleted as they finish, but in error conditions
     // we may terminate early and still have some conns to delete here.
     while (thread->conns != NULL) {
@@ -416,6 +438,7 @@ int sm_start_conn(SM_CONN* conn)
     // Post initial IO(s), which will be subsequently reposted by sm_io_loop.
 
     int err = NO_ERROR;
+
     if (conn->io_tx != NULL) {
         if (WSASend(
                 conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
@@ -455,9 +478,9 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
     // conns as appropriate.
 
     int err = NO_ERROR;
-    int xferred;
-    SM_CONN* conn;
-    SM_IO* io;
+    int xferred = 0;
+    SM_CONN* conn = NULL;
+    SM_IO* io = NULL;
 
     while (TRUE) {
 
@@ -507,25 +530,29 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 
         if (conn->to_xfer == 0 || *conn_dir_xferred < conn->to_xfer) {
             if (io->dir == SmDirectionSend) {
-                err = WSASend(
-                    conn->sock, &(io->wsabuf), 1, NULL,
-                    0, &(io->ov), NULL);
-            } else {
-                err = WSARecv(
-                    conn->sock, &(io->wsabuf), 1, NULL,
-                    &(io->recvflags), &(io->ov), NULL);
-            }
-            if (err == SOCKET_ERROR) {
-                err = WSAGetLastError();
-                if (err != WSA_IO_PENDING) {
-                    if (io->dir == SmDirectionSend) {
+                if (WSASend(
+                        conn->sock, &(io->wsabuf), 1, NULL, 0, &(io->ov), NULL)
+                            == SOCKET_ERROR) {
+                    err = WSAGetLastError();
+                    if (err != WSA_IO_PENDING) {
                         printf("WSASend failed with %d\n", err);
+                        goto exit;
                     } else {
-                        printf("WSARecv failed with %d\n", err);
+                        err = NO_ERROR;
                     }
-                    goto exit;
-                } else {
-                    err = NO_ERROR;
+                }
+            } else {
+                if (WSARecv(
+                        conn->sock, &(io->wsabuf), 1, NULL,
+                        &(io->recvflags), &(io->ov), NULL)
+                            == SOCKET_ERROR) {
+                    err = WSAGetLastError();
+                    if (err != WSA_IO_PENDING) {
+                        printf("WSARecv failed with %d\n", err);
+                        goto exit;
+                    } else {
+                        err = NO_ERROR;
+                    }
                 }
             }
         } else {
@@ -585,11 +612,10 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         }
     }
 
-    SM_CONN* conn =
-        sm_new_conn(thread, sock, peer->dir, sm_nbytes / sm_nsock);
+    SM_CONN* conn = sm_new_conn(thread, sock, peer->dir, sm_nbytes / sm_nsock);
     if (conn == NULL) {
-        printf("Failed to create new conn\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
+        printf("Failed to create new conn\n");
         goto exit;
     }
 
@@ -631,8 +657,8 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         printf("send (hello) failed with %d\n", err);
         goto exit;
     } else if (bytes_sent != sizeof(hello)) {
-        printf("send unexpectedly sent only part of HELLO\n");
         err = 1;
+        printf("send unexpectedly sent only part of HELLO\n");
         goto exit;
     }
 
@@ -703,7 +729,7 @@ void sm_service(void)
 {
     int err = 0;
     SOCKET ls = INVALID_SOCKET;
-    SM_THREAD* thread;
+    SM_THREAD* thread = NULL;
 
     SYSTEM_INFO sysinfo;
     GetSystemInfo(&sysinfo);
@@ -771,10 +797,10 @@ DWORD sm_client_fn(void* param)
 
 void sm_client(void)
 {
-    int err;
-    SM_THREAD* thread;
-    SM_PEER* peer;
-    SM_CONN* conn;
+    int err = NO_ERROR;
+    SM_THREAD* thread = NULL;
+    SM_PEER* peer = NULL;
+    SM_CONN* conn = NULL;
 
     for (int i = 0; i < sm_nthread; i++) {
         thread = sm_new_thread(sm_client_fn);
@@ -834,6 +860,8 @@ void sm_client(void)
 
     thread = sm_threads;
     while (thread != NULL) {
+        // Hold thread lock while we walk the conn list in case a conn finishes
+        // and wants to be removed from the list before we're done walking.
         EnterCriticalSection(&thread->lock);
         conn = thread->conns;
         while (conn != NULL) {
@@ -1055,18 +1083,12 @@ int __cdecl wmain(int argc, wchar_t** argv)
     }
 
 exit:
-    SM_THREAD* thread = sm_threads;
-    while (thread != NULL) {
-        SM_THREAD* next = thread->next;
-        sm_del_thread(thread);
-        thread = next;
+    while (sm_threads != NULL) {
+        sm_del_thread(sm_threads);
     }
 
-    SM_PEER* peer = sm_peers;
-    while (peer != NULL) {
-        SM_PEER* next = peer->next;
-        sm_del_peer(peer);
-        peer = next;
+    while (sm_peers != NULL) {
+        sm_del_peer(sm_peers);
     }
 
     if (need_wsacleanup) {
