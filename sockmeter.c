@@ -1,28 +1,32 @@
-// Sockmeter: a Windows network performance measurement tool.
-// Currently only supports TCP.
-//
-// Compared to iperf: Optimized for Windows with IOCP.
-//
-// Compared to ntttcp: Allows the thread count and socket count to be
-// separately configured; no need to re-run the service on each execution;
-// the service uses a single port number.
-//
-// TODO: avg packet size
-// TODO: cpu%
-// TODO: latency
-// TODO: write stats to json
-// TODO: TCP_NODELAY option
-// TODO: service sends back info (cpu% etc)
-// TODO: consider SO_LINGER/SO_DONTLINGER
-// TODO: UDP
-// TODO: Should -nbytes be per-socket or across all sockets?
-// TODO: Currently the service side thread count is min(64, numProc).
-//       Consider creating a number of threads equal to the number of
-//       RSS processors and assigning conns to threads based on the output of
-//       SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
-// TODO: Less alarming messages for ungraceful connection closure on service
-//       side (or perhaps do graceful connection closure).
-// TODO: -v4 and -v6 cmdline arg to force v4/6 when using hostnames
+/*
+Sockmeter: a Windows network performance measurement tool.
+Currently only supports TCP.
+
+Compared to iperf: Optimized for Windows with IOCP.
+
+Compared to ntttcp: Allows the thread count and socket count to be
+separately configured; no need to re-run the service on each execution;
+the service uses a single port number.
+
+TODO:
+-avg packet size
+-cpu%
+-latency
+-write stats to json
+-TCP_NODELAY option
+-service sends back info (cpu% etc)
+-consider SO_LINGER/SO_DONTLINGER
+-pingpong
+-UDP
+-Should -nbytes be per-socket or across all sockets?
+-Currently the service side thread count is min(64, numProc).
+-Consider creating a number of threads equal to the number of
+    RSS processors and assigning conns to threads based on the output of
+    SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
+-Less alarming messages for ungraceful connection closure on service
+    side (or perhaps do graceful connection closure).
+-cmdline args to force v4/6 when using hostnames
+*/
 
 #define WIN32_LEAN_AND_MEAN 1
 #include <windows.h>
@@ -84,7 +88,7 @@ typedef enum {
 typedef struct {
     SM_DIRECTION dir;
     ULONG64 to_xfer;
-} SM_MSG_HELLO;
+} SM_REQ;
 #pragma pack(pop)
 
 typedef struct _SM_PEER {
@@ -636,28 +640,28 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         goto exit;
     }
 
-    SM_MSG_HELLO hello = {0};
+    SM_REQ req = {0};
     // If we send then the service receives, and vice versa.
     switch (peer->dir) {
     case SmDirectionSend:
-        hello.dir = SmDirectionRecv;
+        req.dir = SmDirectionRecv;
         break;
     case SmDirectionRecv:
-        hello.dir = SmDirectionSend;
+        req.dir = SmDirectionSend;
         break;
     case SmDirectionBoth:
-        hello.dir = SmDirectionBoth;
+        req.dir = SmDirectionBoth;
         break;
     }
-    hello.to_xfer = conn->to_xfer;
-    int bytes_sent = send(conn->sock, (char*)&hello, sizeof(hello), 0);
+    req.to_xfer = conn->to_xfer;
+    int bytes_sent = send(conn->sock, (char*)&req, sizeof(req), 0);
     if (bytes_sent == SOCKET_ERROR) {
         err = WSAGetLastError();
-        printf("send (hello) failed with %d\n", err);
+        printf("send (req) failed with %d\n", err);
         goto exit;
-    } else if (bytes_sent != sizeof(hello)) {
+    } else if (bytes_sent != sizeof(req)) {
         err = 1;
-        printf("send unexpectedly sent only part of HELLO\n");
+        printf("send unexpectedly sent only part of req\n");
         goto exit;
     }
 
@@ -687,15 +691,15 @@ SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 
     DEVTRACE("Accepted connection\n");
 
-    SM_MSG_HELLO hello = {0};
-    int xferred = recv(ss, (char*)&hello, sizeof(hello), MSG_WAITALL);
+    SM_REQ req = {0};
+    int xferred = recv(ss, (char*)&req, sizeof(req), MSG_WAITALL);
     if (xferred == SOCKET_ERROR) {
         err = WSAGetLastError();
-        printf("recv(hello) failed with %d\n", err);
+        printf("recv(req) failed with %d\n", err);
         goto exit;
     }
 
-    conn = sm_new_conn(thread, ss, hello.dir, hello.to_xfer);
+    conn = sm_new_conn(thread, ss, req.dir, req.to_xfer);
     if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new conn for accept socket\n");
