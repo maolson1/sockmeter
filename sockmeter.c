@@ -1,6 +1,5 @@
 /*
-Sockmeter: a Windows network performance measurement tool.
-Currently only supports TCP.
+Sockmeter: a Windows TCP performance measurement tool.
 
 Compared to iperf: Optimized for Windows with IOCP.
 
@@ -9,22 +8,20 @@ separately configured; no need to re-run the service on each execution;
 the service uses a single port number.
 
 TODO:
--avg packet size
--cpu%
--latency
+-add metric: avg packet size
+-add metric: cpu%
+-add metric: req latency
 -write stats to json
+-iofrag option (pass multiple wsabufs to WSASend/WSARecv)
+-reuseconn option (default true; whether to reuse conns for new reqs)
 -TCP_NODELAY option
 -service sends back info (cpu% etc)
 -consider SO_LINGER/SO_DONTLINGER
 -pingpong
--UDP
--Should -nbytes be per-socket or across all sockets?
 -Currently the service side thread count is min(64, numProc).
--Consider creating a number of threads equal to the number of
+    Consider creating a number of threads equal to the number of
     RSS processors and assigning conns to threads based on the output of
     SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
--Less alarming messages for ungraceful connection closure on service
-    side (or perhaps do graceful connection closure).
 -cmdline args to force v4/6 when using hostnames
 */
 
@@ -54,24 +51,24 @@ TODO:
 "       Run sockmeter client.\n" \
 "\n" \
 "[client_args]:\n" \
-"   -send [h] [p]:\n" \
-"   -recv [h] [p]:\n" \
-"   -sendrecv [h] [p]: Send/receive to/from host h at port p.\n" \
+"   -tx [h] [p]:\n" \
+"   -rx [h] [p]:\n" \
+"   -txrx [h] [p]: Send/receive to/from host h at port p.\n" \
 "                  Pass multiple times to send/receive data to/from\n" \
 "                  multiple peers.\n" \
+"   -t [#]: Total milliseconds (if not passed, one request is processed).\n" \
 "   -nsock [#]: number of sockets.\n" \
 "   -nthread [#]: number of threads.\n" \
-"   -nbytes [#]: Total bytes (divided between sockets).\n" \
-"   -t [#]: Total milliseconds (cannot pass both -nbytes and -t)\n" \
+"   -iosize [#]: Size of buffer passed in each socket send/recv call.\n" \
+"   -reqsize [#]: bytes transferred per request.\n" \
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket.\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket.\n" \
-"   -iosize [#]: Set size of each socket send/recv call.\n" \
 "\n" \
 "Examples:\n" \
 "   sockmeter -svc 30000\n" \
-"   sockmeter -nsock 100 -nthread 4 -send 127.0.0.1 30000 -recv pc2 30001\n"
+"   sockmeter -nsock 100 -nthread 4 -tx 127.0.0.1 30000 -rx pc2 30001\n"
 
-#define DEVBUILD
+// #define DEVBUILD
 #ifdef DEVBUILD
     #define DEVTRACE printf
 #else
@@ -81,7 +78,7 @@ TODO:
 typedef enum {
     SmDirectionSend,
     SmDirectionRecv,
-    SmDirectionBoth
+    SmDirectionBoth,
 } SM_DIRECTION;
 
 #pragma pack(push,1)
@@ -109,14 +106,23 @@ typedef struct _SM_IO {
     int bufsize;
 } SM_IO;
 
+typedef enum {
+    SmConnStateSvcGetReq,
+    SmConnStateSvcDoReq,
+    SmConnStateCliIssueReq,
+    SmConnStateCliDoReq,
+} SM_CONN_STATE;
+
 typedef struct _SM_CONN {
     struct _SM_CONN* next;
     SOCKET sock;
+    SM_CONN_STATE state;
+    SM_DIRECTION dir;
     SM_IO* io_tx;
     SM_IO* io_rx;
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
-    ULONG64 to_xfer; // 0 means transfer indefinitely.
+    ULONG64 to_xfer; // how many bytes to xfer for current req
 } SM_CONN;
 
 typedef struct _SM_THREAD {
@@ -132,11 +138,12 @@ typedef struct _SM_THREAD {
 
 // Variables for both client and service:
 SM_THREAD* sm_threads;
-int sm_iosize = 65535;
+int sm_iosize = 65535;  // 64KB default
+BOOLEAN svcmode = FALSE;
 
 // Variables for client only:
 SM_PEER* sm_peers;
-ULONG64 sm_nbytes;
+ULONG64 sm_reqsize = 16000000;  // 16MM default
 int sm_nsock;
 int sm_nthread;
 int sm_sbuf = -1;
@@ -285,7 +292,7 @@ void sm_del_io(SM_IO* io)
 }
 
 SM_CONN* sm_new_conn(
-    SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir, ULONG64 to_xfer)
+    SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir, SM_CONN_STATE state)
 {
     int err = NO_ERROR;
     SM_CONN* conn = NULL;
@@ -305,28 +312,25 @@ SM_CONN* sm_new_conn(
         goto exit;
     }
 
-    if (dir == SmDirectionSend || dir == SmDirectionBoth) {
-        conn->io_tx = sm_new_io(SmDirectionSend);
-        if (conn->io_tx == NULL) {
-            printf("Failed to create new send IO\n");
-            err = ERROR_NOT_ENOUGH_MEMORY;
-            goto exit;
-        }
+    conn->io_tx = sm_new_io(SmDirectionSend);
+    if (conn->io_tx == NULL) {
+        printf("Failed to create new send IO\n");
+        err = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
     }
 
-    if (dir == SmDirectionRecv || dir == SmDirectionBoth) {
-        conn->io_rx = sm_new_io(SmDirectionRecv);
-        if (conn->io_rx == NULL) {
-            printf("Failed to create new recv IO\n");
-            err = ERROR_NOT_ENOUGH_MEMORY;
-            goto exit;
-        }
+    conn->io_rx = sm_new_io(SmDirectionRecv);
+    if (conn->io_rx == NULL) {
+        printf("Failed to create new recv IO\n");
+        err = ERROR_NOT_ENOUGH_MEMORY;
+        goto exit;
     }
 
     conn->sock = sock;
     conn->xferred_tx = 0;
     conn->xferred_rx = 0;
-    conn->to_xfer = to_xfer;
+    conn->dir = dir;
+    conn->state = state;
 
     EnterCriticalSection(&thread->lock);
     conn->next = thread->conns;
@@ -359,8 +363,6 @@ void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
     }
     *c = conn->next;
     thread->numconns--;
-    thread->xferred_tx += conn->xferred_tx;
-    thread->xferred_rx += conn->xferred_rx;
     LeaveCriticalSection(&thread->lock);
 
     if (conn->sock != INVALID_SOCKET) {
@@ -436,7 +438,7 @@ void sm_del_thread(SM_THREAD* thread)
     }
     *t = thread->next;
 
-    // Normally conns are deleted as they finish, but in error conditions
+    // Normally conns are deleted as they finish, but if there's an error
     // we may terminate early and still have some conns to delete here.
     while (thread->conns != NULL) {
         sm_del_conn(thread, thread->conns);
@@ -447,39 +449,110 @@ void sm_del_thread(SM_THREAD* thread)
     free(thread);
 }
 
-int sm_start_conn(SM_CONN* conn)
+int sm_send(SM_CONN* conn, int offset, int numbytes)
 {
-    // Post initial IO(s), which will be subsequently reposted by sm_io_loop.
-
     int err = NO_ERROR;
 
-    if (conn->io_tx != NULL) {
-        if (WSASend(
-                conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
-                0, &(conn->io_tx->ov), NULL) == SOCKET_ERROR) {
-            err = WSAGetLastError();
-            if (err != WSA_IO_PENDING) {
-                printf("WSASend failed with %d\n", err);
-                goto exit;
-            } else {
-                err = NO_ERROR;
-            }
+    DEVTRACE("sm_send offset=%d numbytes=%d\n", offset, numbytes);
+
+    conn->io_tx->wsabuf.buf = conn->io_tx->buf + offset;
+    conn->io_tx->wsabuf.len = numbytes;
+
+    if (WSASend(
+            conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
+            0, &(conn->io_tx->ov), NULL) == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        if (err != WSA_IO_PENDING) {
+            printf("WSASend failed with %d\n", err);
+            goto exit;
+        } else {
+            err = NO_ERROR;
         }
     }
 
-    if (conn->io_rx != NULL) {
-        if (WSARecv(
-                conn->sock, &(conn->io_rx->wsabuf), 1, NULL,
-                &(conn->io_rx->recvflags), &(conn->io_rx->ov), NULL)
-                    == SOCKET_ERROR) {
-            err = WSAGetLastError();
-            if (err != WSA_IO_PENDING) {
-                printf("WSARecv failed with %d\n", err);
-                goto exit;
-            } else {
-                err = NO_ERROR;
-            }
+exit:
+    return err;
+}
+
+int sm_recv(SM_CONN* conn, int offset, int numbytes, int recvflags)
+{
+    int err = NO_ERROR;
+
+    DEVTRACE("sm_recv offset=%d numbytes=%d\n", offset, numbytes);
+
+    conn->io_rx->wsabuf.buf = conn->io_rx->buf + offset;
+    conn->io_rx->wsabuf.len = numbytes;
+    conn->io_rx->recvflags = recvflags;
+
+    if (WSARecv(
+            conn->sock, &(conn->io_rx->wsabuf), 1, NULL,
+            &(conn->io_rx->recvflags), &(conn->io_rx->ov), NULL)
+                == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        if (err != WSA_IO_PENDING) {
+            printf("WSARecv failed with %d\n", err);
+            goto exit;
+        } else {
+            err = NO_ERROR;
         }
+    }
+exit:
+    return err;
+}
+
+int sm_issue_req(SM_CONN* conn)
+{
+    int err = NO_ERROR;
+
+    DEVTRACE("issue req\n");
+
+    SM_REQ* req = (SM_REQ*)conn->io_tx->buf;
+    switch (conn->dir) {
+    case SmDirectionSend:
+        req->dir = SmDirectionRecv;
+        break;
+    case SmDirectionRecv:
+        req->dir = SmDirectionSend;
+        break;
+    case SmDirectionBoth:
+        req->dir = SmDirectionBoth;
+        break;
+    }
+    req->to_xfer = sm_reqsize;
+
+    conn->to_xfer = req->to_xfer;
+
+    conn->io_tx->to_xfer = sizeof(SM_REQ);
+    err = sm_send(conn, 0, sizeof(SM_REQ));
+    if (err != NO_ERROR) {
+        goto exit;
+    }
+
+    // If we're receiving data as part of this req, get that started.
+    if (conn->dir == SmDirectionRecv ||
+        conn->dir == SmDirectionBoth) {
+
+        conn->io_rx->to_xfer = (int)min(conn->io_rx->bufsize, req->to_xfer);
+        err = sm_recv(conn, 0, conn->io_rx->to_xfer, 0);
+        if (err != NO_ERROR) {
+            goto exit;
+        }
+    }
+
+exit:
+    return err;
+}
+
+int sm_recv_req(SM_CONN* conn)
+{
+    int err = NO_ERROR;
+
+    DEVTRACE("issue recv for req\n");
+
+    conn->io_rx->to_xfer = sizeof(SM_REQ);
+    err = sm_recv(conn, 0, sizeof(SM_REQ), MSG_WAITALL);
+    if (err != NO_ERROR) {
+        goto exit;
     }
 
 exit:
@@ -506,75 +579,157 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             goto exit;
         }
 
-        if (sm_cleanup_time || xferred == 0) {
+        DEVTRACE("io (%s) complete, xferred = %d\n",
+            io->dir == SmDirectionSend ? "tx" : "rx", xferred);
+
+        if (xferred == 0) {
+            DEVTRACE("break for xferred == 0; io dir = %d\n", io->dir);
             break;
         }
 
-        // Figure out how much to transfer next and adjust the wsabuf
-        // appropriately: Either we want to transfer the remainder of the IO, or
-        // we want to resend the IO from the beginning, or we are near the end
-        // of the stream and want to send only part of the IO.
+        if (conn->state == SmConnStateCliIssueReq &&
+            io->dir == SmDirectionSend) {
 
-        // Reminder: (conn->to_xfer == 0) means send forever.
+            // Req header sent.
 
-        ULONG64* conn_dir_xferred;
-        if (io->dir == SmDirectionSend) {
-            conn_dir_xferred = &conn->xferred_tx;
-        } else {
-            conn_dir_xferred = &conn->xferred_rx;
-        }
+            DEVTRACE("send req complete\n");
 
-        io->xferred += xferred;
-        if (io->xferred < io->to_xfer) {
-            io->wsabuf.buf = &(io->buf[io->xferred]);
-            io->wsabuf.len = io->to_xfer - io->xferred;
-        } else if (conn->to_xfer == 0 ||
-                   conn->to_xfer > *conn_dir_xferred + io->to_xfer) {
-            *conn_dir_xferred += io->to_xfer;
-            if (conn->to_xfer != 0 &&
-                io->to_xfer > (conn->to_xfer - *conn_dir_xferred)) {
-                io->to_xfer = (DWORD)(conn->to_xfer - *conn_dir_xferred);
+            conn->state = SmConnStateCliDoReq;
+            if (conn->dir == SmDirectionSend ||
+                    conn->dir == SmDirectionBoth) {
+                io->xferred = 0;
+                io->to_xfer = (int)min(io->bufsize, conn->to_xfer);
+                err = sm_send(conn, 0, io->to_xfer);
+                if (err != NO_ERROR) {
+                    goto exit;
+                }
             }
-            io->wsabuf.buf = io->buf;
-            io->wsabuf.len = io->to_xfer;
-            io->xferred = 0;
-        } else {
-            *conn_dir_xferred = conn->to_xfer;
-        }
 
-        if (conn->to_xfer == 0 || *conn_dir_xferred < conn->to_xfer) {
+        } else if (conn->state == SmConnStateSvcGetReq) {
+
+            // Req header received.
+
+            DEVTRACE("recv req complete\n");
+
+            conn->state = SmConnStateSvcDoReq;
+
+            if (xferred != sizeof(SM_REQ)) {
+                printf("Expected sizeof(SM_REQ) bytes but got %d\n", xferred);
+                err = 1;
+                goto exit;
+            }
+            SM_REQ* req = (SM_REQ*)conn->io_rx->buf;
+            conn->to_xfer = req->to_xfer;
+            conn->dir = req->dir;
+            if (conn->dir == SmDirectionSend || conn->dir == SmDirectionBoth) {
+                conn->io_tx->to_xfer =
+                    (int)min(conn->io_tx->bufsize, conn->to_xfer);
+                err = sm_send(conn, 0, conn->io_tx->to_xfer);
+                if (err != NO_ERROR) {
+                    goto exit;
+                }
+            }
+            if (conn->dir == SmDirectionRecv || conn->dir == SmDirectionBoth) {
+                conn->io_rx->to_xfer =
+                    (int)min(conn->io_rx->bufsize, conn->to_xfer);
+                err = sm_recv(conn, 0, conn->io_rx->to_xfer, 0);
+                if (err != NO_ERROR) {
+                    goto exit;
+                }
+            }
+
+        } else {
+
+            // Req payload [partly or fully] sent or received.
+
+            ULONG64* conn_dir_xferred;
             if (io->dir == SmDirectionSend) {
-                if (WSASend(
-                        conn->sock, &(io->wsabuf), 1, NULL, 0, &(io->ov), NULL)
-                            == SOCKET_ERROR) {
-                    err = WSAGetLastError();
-                    if (err != WSA_IO_PENDING) {
-                        printf("WSASend failed with %d\n", err);
+                conn_dir_xferred = &conn->xferred_tx;
+            } else {
+                conn_dir_xferred = &conn->xferred_rx;
+            }
+
+            io->xferred += xferred;
+            *conn_dir_xferred += xferred;
+            DEVTRACE("conn_dir_xferred now %llu\n", *conn_dir_xferred);
+
+            if (io->xferred < io->to_xfer) {
+                // Continue current buf
+                if (io->dir == SmDirectionSend) {
+                    err = sm_send(conn, io->xferred, io->to_xfer - io->xferred);
+                    if (err != NO_ERROR) {
                         goto exit;
-                    } else {
-                        err = NO_ERROR;
+                    }
+                } else {
+                    err = sm_recv(
+                        conn, io->xferred, io->to_xfer - io->xferred, 0);
+                    if (err != NO_ERROR) {
+                        goto exit;
+                    }
+                }
+            } else if (conn->to_xfer == 0 ||
+                    *conn_dir_xferred < conn->to_xfer) {
+                // New buf
+                if (conn->to_xfer != 0 &&
+                    io->to_xfer > (conn->to_xfer - *conn_dir_xferred)) {
+                    // Partial buf fulfills req
+                    io->to_xfer = (DWORD)(conn->to_xfer - *conn_dir_xferred);
+                }
+                if (io->dir == SmDirectionSend) {
+                    err = sm_send(conn, 0, io->to_xfer);
+                    if (err != NO_ERROR) {
+                        goto exit;
+                    }
+                } else {
+                    err = sm_recv(conn, 0, io->to_xfer, 0);
+                    if (err != NO_ERROR) {
+                        goto exit;
                     }
                 }
             } else {
-                if (WSARecv(
-                        conn->sock, &(io->wsabuf), 1, NULL,
-                        &(io->recvflags), &(io->ov), NULL)
-                            == SOCKET_ERROR) {
-                    err = WSAGetLastError();
-                    if (err != WSA_IO_PENDING) {
-                        printf("WSARecv failed with %d\n", err);
-                        goto exit;
+                // Finished with [this direction of] req
+                if (conn->dir != SmDirectionBoth ||
+                    (conn->xferred_tx == conn->to_xfer &&
+                     conn->xferred_rx == conn->to_xfer)) {
+
+                    DEVTRACE("finished req\n");
+                    // Finished with req
+
+                    thread->xferred_tx += conn->xferred_tx;
+                    conn->xferred_tx = 0;
+                    thread->xferred_rx += conn->xferred_rx;
+                    conn->xferred_rx = 0;
+
+                    if (!svcmode &&
+                        (sm_cleanup_time || sm_durationms == 0)) {
+                        DEVTRACE("shutting down conn\n");
+                        shutdown(conn->sock, SD_BOTH);
+                        sm_del_conn(thread, conn);
                     } else {
-                        err = NO_ERROR;
+                        if (svcmode) {
+                            conn->state = SmConnStateSvcGetReq;
+                            err = sm_recv_req(conn);
+                            if (err != NO_ERROR) {
+                                goto exit;
+                            }
+                        } else {
+                            conn->state = SmConnStateCliIssueReq;
+                            err = sm_issue_req(conn);
+                            if (err != NO_ERROR) {
+                                goto exit;
+                            }
+                        }
                     }
                 }
             }
-        } else {
-            shutdown(conn->sock, SD_BOTH);
-            sm_del_conn(thread, conn);
-            if (thread->numconns == 0) {
-                break;
-            }
+        }
+
+        // TODO: synchronization issue here- first conn could finish and drop
+        // counter to zero before second one increments counter, and we'd
+        // terminate prematurely.
+        if (thread->numconns == 0) {
+            DEVTRACE("all conns done\n");
+            break;
         }
     }
 
@@ -584,10 +739,9 @@ exit:
 
 int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
 {
-    // Create an outbound connection and an SM_CONN for it.
-
     int err = NO_ERROR;
     SOCKET sock = INVALID_SOCKET;
+    SM_CONN* conn = NULL;
 
     sock = WSASocket(
         AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -626,7 +780,7 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         }
     }
 
-    SM_CONN* conn = sm_new_conn(thread, sock, peer->dir, sm_nbytes / sm_nsock);
+    conn = sm_new_conn(thread, sock, peer->dir, SmConnStateCliIssueReq);
     if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new conn\n");
@@ -640,33 +794,17 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         goto exit;
     }
 
-    SM_REQ req = {0};
-    // If we send then the service receives, and vice versa.
-    switch (peer->dir) {
-    case SmDirectionSend:
-        req.dir = SmDirectionRecv;
-        break;
-    case SmDirectionRecv:
-        req.dir = SmDirectionSend;
-        break;
-    case SmDirectionBoth:
-        req.dir = SmDirectionBoth;
-        break;
-    }
-    req.to_xfer = conn->to_xfer;
-    int bytes_sent = send(conn->sock, (char*)&req, sizeof(req), 0);
-    if (bytes_sent == SOCKET_ERROR) {
-        err = WSAGetLastError();
-        printf("send (req) failed with %d\n", err);
-        goto exit;
-    } else if (bytes_sent != sizeof(req)) {
-        err = 1;
-        printf("send unexpectedly sent only part of req\n");
+    err = sm_issue_req(conn);
+    if (err != NO_ERROR) {
+        printf("failed to send req\n");
         goto exit;
     }
 
 exit:
     if (err != NO_ERROR) {
+        if (conn != NULL) {
+            sm_del_conn(thread, conn);
+        }
         if (sock != INVALID_SOCKET) {
             closesocket(sock);
         }
@@ -676,9 +814,6 @@ exit:
 
 SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 {
-    // Call accept on the input listening socket, and create an SM_CONN for
-    // the resulting inbound connection.
-
     int err = NO_ERROR;
     SM_CONN* conn = NULL;
 
@@ -691,21 +826,19 @@ SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 
     DEVTRACE("Accepted connection\n");
 
-    SM_REQ req = {0};
-    int xferred = recv(ss, (char*)&req, sizeof(req), MSG_WAITALL);
-    if (xferred == SOCKET_ERROR) {
-        err = WSAGetLastError();
-        printf("recv(req) failed with %d\n", err);
-        goto exit;
-    }
-
-    conn = sm_new_conn(thread, ss, req.dir, req.to_xfer);
+    conn = sm_new_conn(thread, ss, SmDirectionBoth, SmConnStateSvcGetReq);
     if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new conn for accept socket\n");
         goto exit;
     }
     ss = INVALID_SOCKET; // conn owns socket now.
+
+    err = sm_recv_req(conn);
+    if (err != 0) {
+        printf("failed to issue recv for req\n");
+        goto exit;
+    }
 
 exit:
     if (err != NO_ERROR) {
@@ -730,7 +863,6 @@ DWORD sm_service_fn(void* param)
 
 void sm_service(void)
 {
-    int err = 0;
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
 
@@ -768,7 +900,7 @@ void sm_service(void)
         goto exit;
     }
 
-    DEVTRACE("Listening on port %u\n", ntohs(SS_PORT(&sm_svcaddr)));
+    printf("Listening on port %u\n", ntohs(SS_PORT(&sm_svcaddr)));
 
     thread = sm_threads;
     while (TRUE) {
@@ -779,11 +911,6 @@ void sm_service(void)
         thread = thread->next;
         if (thread == NULL) {
             thread = sm_threads;
-        }
-
-        err = sm_start_conn(conn);
-        if (err != 0) {
-            goto exit;
         }
     }
 
@@ -803,7 +930,6 @@ void sm_client(void)
     int err = NO_ERROR;
     SM_THREAD* thread = NULL;
     SM_PEER* peer = NULL;
-    SM_CONN* conn = NULL;
 
     for (int i = 0; i < sm_nthread; i++) {
         thread = sm_new_thread(sm_client_fn);
@@ -812,19 +938,11 @@ void sm_client(void)
         }
     }
 
-    printf("Connecting...\n");
+    printf("Testing...\n");
+
+    ULONG64 t_start_ms = sm_curtime_ms();
 
     // Assign conns to threads and peers round-robin.
-    //
-    // We first connect all conns and then start all conns, rather than
-    // starting each conn as it's connected. This is for two reasons:
-    // 1) If we fail to connect to one of multiple peers, we will abort and
-    //    it's better not to have started transferring data with the other
-    //    peers.
-    // 2) This makes synchronization in sm_io_loop easier- we add all the conns
-    //    to the thread so that "numconns" is a complete count, and only then
-    //    do we post the IOs, so we won't have a race where numconns drops
-    //    back to zero before we've added all of the conns.
 
     thread = sm_threads;
     peer = sm_peers;
@@ -841,30 +959,6 @@ void sm_client(void)
         if (peer == NULL) {
             peer = sm_peers;
         }
-    }
-
-    printf("Testing...\n");
-
-    // TODO: consider including connection establishment in the timing.
-
-    ULONG64 t_start_ms = sm_curtime_ms();
-
-    thread = sm_threads;
-    while (thread != NULL) {
-        // Hold thread lock while we walk the conn list in case a conn finishes
-        // and wants to be removed from the list before we're done walking.
-        EnterCriticalSection(&thread->lock);
-        conn = thread->conns;
-        while (conn != NULL) {
-            err = sm_start_conn(conn);
-            if (err != 0) {
-                LeaveCriticalSection(&thread->lock);
-                return;
-            }
-            conn = conn->next;
-        }
-        LeaveCriticalSection(&thread->lock);
-        thread = thread->next;
     }
 
     if (sm_durationms > 0) {
@@ -884,26 +978,19 @@ void sm_client(void)
     printf("Finished.\n");
 
     if (t_elapsed_ms == 0) {
-        printf("WARNING: transfer took less than 1ms; need to run longer.\n");
+        printf(
+            "Transfer duration less than 1ms; must be longer"
+            " to compute metrics.\n");
     } else {
         ULONG64 xferred_tx = 0;
         ULONG64 xferred_rx = 0;
         thread = sm_threads;
         while (thread != NULL) {
-            // Depending on whether we're in -t or -nbytes mode, the conns
-            // may or may not have been deleted at this point. So add the
-            // thread's count of bytes xferred by deleted conns to the
-            // counts in any active conns.
-            EnterCriticalSection(&thread->lock);
+            if (thread->conns != NULL) {
+                printf("unexpected: thread still has active conns\n");
+            }
             xferred_tx += thread->xferred_tx;
             xferred_rx += thread->xferred_rx;
-            conn = thread->conns;
-            while (conn != NULL) {
-                xferred_tx += conn->xferred_tx;
-                xferred_rx += conn->xferred_rx;
-                conn = conn->next;
-            }
-            LeaveCriticalSection(&thread->lock);
             thread = thread->next;
         }
         printf(
@@ -929,7 +1016,6 @@ int __cdecl wmain(int argc, wchar_t** argv)
     int err = 0;
     BOOLEAN need_wsacleanup = FALSE;
     WSADATA wd = {0};
-    BOOLEAN svcmode = FALSE;
     int numpeers = 0;
 
     if (argc == 1) {
@@ -965,8 +1051,8 @@ int __cdecl wmain(int argc, wchar_t** argv)
         } else if (argsleft >= 1 && !wcscmp(*name, L"-nthread")) {
             sm_nthread = _wtoi(*av);
             av++; ac++;
-        } else if (argsleft >= 1 && !wcscmp(*name, L"-nbytes")) {
-            sm_nbytes = _wtoi64(*av);
+        } else if (argsleft >= 1 && !wcscmp(*name, L"-reqsize")) {
+            sm_reqsize = _wtoi64(*av);
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-t")) {
             sm_durationms = _wtoi(*av);
@@ -980,25 +1066,25 @@ int __cdecl wmain(int argc, wchar_t** argv)
         } else if (argsleft >= 1 && !wcscmp(*name, L"-iosize")) {
             sm_iosize = _wtoi(*av);
             av++; ac++;
-        } else if (argsleft >= 2 && !wcscmp(*name, L"-send")) {
+        } else if (argsleft >= 2 && !wcscmp(*name, L"-tx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionSend) == NULL) {
-                printf("Failed to parse \"-send %ls %ls\"\n", *av, *(av + 1));
+                printf("Failed to parse \"-tx %ls %ls\"\n", *av, *(av + 1));
                 err = ERROR_INVALID_PARAMETER;
                 goto exit;
             }
             numpeers++;
             av += 2; ac += 2;
-        } else if (argsleft >= 2 && !wcscmp(*name, L"-recv")) {
+        } else if (argsleft >= 2 && !wcscmp(*name, L"-rx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionRecv) == NULL) {
-                printf("Failed to parse \"-recv %ls %ls\"\n", *av, *(av + 1));
+                printf("Failed to parse \"-rx %ls %ls\"\n", *av, *(av + 1));
                 err = ERROR_INVALID_PARAMETER;
                 goto exit;
             }
             numpeers++;
             av += 2; ac += 2;
-        } else if (argsleft >= 2 && !wcscmp(*name, L"-sendrecv")) {
+        } else if (argsleft >= 2 && !wcscmp(*name, L"-txrx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionBoth) == NULL) {
-                printf("Failed to parse \"-sendrecv %ls %ls\"\n", *av, *(av + 1));
+                printf("Failed to parse \"-txrx %ls %ls\"\n", *av, *(av + 1));
                 err = ERROR_INVALID_PARAMETER;
                 goto exit;
             }
@@ -1012,7 +1098,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
     }
 
     if (svcmode && numpeers > 0) {
-        printf("ERROR: cannot pass both -svc and (-send or -recv or -sendrecv).\n");
+        printf("ERROR: cannot pass both -svc and (-tx or -rx or -txrx).\n");
         err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
@@ -1023,16 +1109,8 @@ int __cdecl wmain(int argc, wchar_t** argv)
         goto exit;
     }
 
-    if (sm_nbytes != 0 && sm_iosize > sm_nbytes) {
-        // This restriction is mainly for convenience- we always post a
-        // full IO up front.
-        printf("ERROR: cannot set -iosize larger than -nbytes.\n");
-        err = ERROR_INVALID_PARAMETER;
-        goto exit;
-    }
-
-    if (sm_nbytes != 0 && sm_durationms != 0) {
-        printf("ERROR: cannot pass both -t and -nbytes.\n");
+    if (sm_iosize < sizeof(SM_REQ)) {
+        printf("iosize must be at least %lu\n", (int)sizeof(SM_REQ));
         err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
@@ -1040,11 +1118,6 @@ int __cdecl wmain(int argc, wchar_t** argv)
     if (svcmode) {
         sm_service();
     } else {
-        if (sm_durationms == 0 && sm_nbytes == 0) {
-            printf("ERROR: Must pass -t or -nbytes.\n");
-            err = ERROR_INVALID_PARAMETER;
-            goto exit;
-        }
         if (sm_nthread == 0) {
             printf("ERROR: Must pass -nthread.\n");
             err = ERROR_INVALID_PARAMETER;
@@ -1056,7 +1129,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
             goto exit;
         }
         if (numpeers == 0) {
-            printf("ERROR: Must pass -send or -recv at least once\n");
+            printf("ERROR: Must pass (-tx or -rx or -txrx) at least once\n");
             err = ERROR_INVALID_PARAMETER;
             goto exit;
         }
