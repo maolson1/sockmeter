@@ -36,7 +36,7 @@ TODO:
 #include <mstcpip.h>
 #include <iphlpapi.h>
 
-#define VERSION "0.0.0"
+#define VERSION "1.0.0"
 
 #define USAGE \
 "sockmeter version " VERSION "\n" \
