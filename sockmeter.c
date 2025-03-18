@@ -120,9 +120,11 @@ typedef struct _SM_CONN {
     SM_DIRECTION dir;
     SM_IO* io_tx;
     SM_IO* io_rx;
+
+    // Byte counters for current req
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
-    ULONG64 to_xfer; // how many bytes to xfer for current req
+    ULONG64 to_xfer;
 } SM_CONN;
 
 typedef struct _SM_THREAD {
@@ -130,30 +132,30 @@ typedef struct _SM_THREAD {
     HANDLE t;
     HANDLE iocp;
     CRITICAL_SECTION lock;
-    ULONG64 xferred_tx; // sum of bytes tx'd by deleted conns.
-    ULONG64 xferred_rx; // sum of bytes rx'd by deleted conns.
+    ULONG64 xferred_tx; // sum of bytes tx'd by completed reqs.
+    ULONG64 xferred_rx; // sum of bytes rx'd by completed reqs.
     SM_CONN* conns;
     ULONG numconns;
 } SM_THREAD;
 
 // Variables for both client and service:
-SM_THREAD* sm_threads;
+SM_THREAD* sm_threads = NULL;
 int sm_iosize = 65535;  // 64KB default
+int sm_sbuf = -1;
+int sm_rbuf = -1;
 BOOLEAN svcmode = FALSE;
 
 // Variables for client only:
-SM_PEER* sm_peers;
+SM_PEER* sm_peers = NULL;
 ULONG64 sm_reqsize = 16000000;  // 16MM default
-int sm_nsock;
-int sm_nthread;
-int sm_sbuf = -1;
-int sm_rbuf = -1;
+int sm_nsock = 0;
+int sm_nthread = 0;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 
 // Variables for service only:
-SOCKADDR_INET sm_svcaddr;
-size_t sm_svcaddrlen;
+SOCKADDR_INET sm_svcaddr = {0};
+size_t sm_svcaddrlen = 0;
 
 ULONG64 sm_curtime_ms(void)
 {
@@ -205,7 +207,7 @@ SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
     } else {
         memcpy((SOCKADDR*)&peer->addr, res->ai_addr, res->ai_addrlen);
     }
-    peer->addrlen = sizeof(SOCKADDR_IN6);
+    peer->addrlen = SOCKADDR_SIZE(AF_INET6);
 
     peer->dir = dir;
 
@@ -863,6 +865,7 @@ DWORD sm_service_fn(void* param)
 
 void sm_service(void)
 {
+    int err = NO_ERROR;
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
 
@@ -888,6 +891,26 @@ void sm_service(void)
             ls, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&opt, sizeof(opt)) != 0) {
         printf("setsockopt(IPV6_V6ONLY) failed with %d\n", WSAGetLastError());
         goto exit;
+    }
+
+    if (sm_sbuf != -1) {
+        if (setsockopt(
+                ls, SOL_SOCKET, SO_SNDBUF, (char*)&sm_sbuf,
+                sizeof(sm_sbuf)) == SOCKET_ERROR) {
+            err = WSAGetLastError();
+            printf("setsockopt(SO_SNDBUF) failed with %d\n", err);
+            goto exit;
+        }
+    }
+
+    if (sm_rbuf != -1) {
+        if (setsockopt(
+                ls, SOL_SOCKET, SO_RCVBUF, (char*)&sm_sbuf,
+                sizeof(sm_sbuf)) == SOCKET_ERROR) {
+            err = WSAGetLastError();
+            printf("setsockopt(SO_RCVBUF) failed with %d\n", err);
+            goto exit;
+        }
     }
 
     if (bind(ls, (SOCKADDR*)&sm_svcaddr, (int)sm_svcaddrlen) == SOCKET_ERROR) {
