@@ -110,17 +110,10 @@ typedef struct _SM_IO {
     int bufsize;
 } SM_IO;
 
-typedef enum {
-    SmConnStateSvcGetReq,
-    SmConnStateSvcDoReq,
-    SmConnStateCliIssueReq,
-    SmConnStateCliDoReq,
-} SM_CONN_STATE;
-
 typedef struct _SM_CONN {
     struct _SM_CONN* next;
     SOCKET sock;
-    SM_CONN_STATE state;
+    BOOLEAN in_req; // TRUE if there's an outstanding req.
     SM_DIRECTION dir;
     SM_IO* io_tx;
     SM_IO* io_rx;
@@ -298,8 +291,7 @@ void sm_del_io(SM_IO* io)
     free(io);
 }
 
-SM_CONN* sm_new_conn(
-    SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir, SM_CONN_STATE state)
+SM_CONN* sm_new_conn(SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir)
 {
     int err = NO_ERROR;
     SM_CONN* conn = NULL;
@@ -337,7 +329,7 @@ SM_CONN* sm_new_conn(
     conn->xferred_tx = 0;
     conn->xferred_rx = 0;
     conn->dir = dir;
-    conn->state = state;
+    conn->in_req = FALSE;
 
     EnterCriticalSection(&thread->lock);
     conn->next = thread->conns;
@@ -594,16 +586,13 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             break;
         }
 
-        if (conn->state == SmConnStateCliIssueReq &&
-            io->dir == SmDirectionSend) {
+        if (!svcmode && !conn->in_req && io->dir == SmDirectionSend) {
 
-            // Req header sent.
-
+            // Req sent.
             DEVTRACE("send req complete\n");
+            conn->in_req = TRUE;
 
-            conn->state = SmConnStateCliDoReq;
-            if (conn->dir == SmDirectionSend ||
-                    conn->dir == SmDirectionBoth) {
+            if (conn->dir == SmDirectionSend || conn->dir == SmDirectionBoth) {
                 io->xferred = 0;
                 io->to_xfer = (int)min(io->bufsize, conn->to_xfer);
                 err = sm_send(conn, 0, io->to_xfer);
@@ -611,14 +600,14 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     goto exit;
                 }
             }
+            // NB: We post the initial recv in sm_issue_req, so no need to post
+            // it here.
 
-        } else if (conn->state == SmConnStateSvcGetReq) {
+        } else if (svcmode && !conn->in_req && io->dir == SmDirectionRecv) {
 
-            // Req header received.
-
+            // Req received.
             DEVTRACE("recv req complete\n");
-
-            conn->state = SmConnStateSvcDoReq;
+            conn->in_req = TRUE;
 
             if (xferred != sizeof(SM_REQ)) {
                 printf("Expected sizeof(SM_REQ) bytes but got %d\n", xferred);
@@ -699,8 +688,10 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     (conn->xferred_tx == conn->to_xfer &&
                      conn->xferred_rx == conn->to_xfer)) {
 
+                    // Finished with req. Record it and either send/recv
+                    // a new req or close the connection.
+
                     DEVTRACE("finished req\n");
-                    // Finished with req
 
                     thread->xferred_tx += conn->xferred_tx;
                     conn->xferred_tx = 0;
@@ -714,13 +705,13 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                         sm_del_conn(thread, conn);
                     } else {
                         if (svcmode) {
-                            conn->state = SmConnStateSvcGetReq;
+                            conn->in_req = FALSE;
                             err = sm_recv_req(conn);
                             if (err != NO_ERROR) {
                                 goto exit;
                             }
                         } else {
-                            conn->state = SmConnStateCliIssueReq;
+                            conn->in_req = FALSE;
                             err = sm_issue_req(conn);
                             if (err != NO_ERROR) {
                                 goto exit;
@@ -787,7 +778,7 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         }
     }
 
-    conn = sm_new_conn(thread, sock, peer->dir, SmConnStateCliIssueReq);
+    conn = sm_new_conn(thread, sock, peer->dir);
     if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new conn\n");
@@ -833,7 +824,7 @@ SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 
     DEVTRACE("Accepted connection\n");
 
-    conn = sm_new_conn(thread, ss, SmDirectionBoth, SmConnStateSvcGetReq);
+    conn = sm_new_conn(thread, ss, SmDirectionBoth);
     if (conn == NULL) {
         err = ERROR_NOT_ENOUGH_MEMORY;
         printf("Failed to create new conn for accept socket\n");
