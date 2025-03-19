@@ -137,6 +137,7 @@ typedef struct _SM_THREAD {
 
 // Variables for both client and service:
 SM_THREAD* sm_threads = NULL;
+int sm_nthread = 1;
 int sm_iosize = 65535;  // 64KB default
 int sm_sbuf = -1;
 int sm_rbuf = -1;
@@ -147,7 +148,6 @@ int sm_ncpu = 0;
 SM_PEER* sm_peers = NULL;
 ULONG64 sm_reqsize = 16000000;  // 16MB default
 int sm_nsock = 1;
-int sm_nthread = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 
@@ -865,10 +865,7 @@ void sm_service(void)
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
 
-    DWORD num_threads = min(sm_ncpu, 64);
-    printf("NumberOfProcessors = %lu; Creating %lu threads\n",
-           sm_ncpu, num_threads);
-    for (DWORD i = 0; i < num_threads; i++) {
+    for (int i = 0; i < sm_nthread; i++) {
         sm_new_thread(sm_service_fn);
     }
 
@@ -916,7 +913,13 @@ void sm_service(void)
         goto exit;
     }
 
-    printf("Listening on port %u\n", ntohs(SS_PORT(&sm_svcaddr)));
+
+    printf(
+        "Started sockmeter service.\n\n"
+        "cpus: %d\n"
+        "threads: %d\n"
+        "listenport: %d\n",
+        sm_ncpu, sm_nthread, ntohs(SS_PORT(&sm_svcaddr)));
 
     thread = sm_threads;
     while (TRUE) {
@@ -1035,6 +1038,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
     BOOLEAN need_wsacleanup = FALSE;
     WSADATA wd = {0};
     int numpeers = 0;
+    BOOLEAN nthread_passed = FALSE;
 
     if (argc == 1) {
         printf(USAGE);
@@ -1097,6 +1101,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-nthread")) {
             sm_nthread = _wtoi(*av);
+            nthread_passed = TRUE;
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-reqsize")) {
             sm_reqsize = _wtoi64(*av);
@@ -1163,6 +1168,9 @@ int __cdecl wmain(int argc, wchar_t** argv)
     }
 
     if (svcmode) {
+        if (!nthread_passed) {
+            sm_nthread = min(sm_ncpu, 64);
+        }
         sm_service();
     } else {
         if (numpeers == 0) {
