@@ -39,30 +39,34 @@ TODO:
 #define VERSION "1.0.0"
 
 #define USAGE \
-"sockmeter version " VERSION "\n" \
+"\nsockmeter version " VERSION "\n" \
 "   Measures network performance.\n" \
+"   Sockmeter client connects to one or more peers running sockmeter\n" \
+"   service. On each connection, the client issues a series of\n" \
+"   requests to send and/or receive data.\n" \
 "\n" \
 "Usage:\n" \
 "   sockmeter -v\n" \
 "       Print the version.\n" \
-"   sockmeter -svc [port]\n" \
-"       Run sockmeter service, listening on port [port].\n" \
+"   sockmeter -svc [p]\n" \
+"       Run sockmeter service, listening on port p.\n" \
 "   sockmeter [client_args]\n" \
 "       Run sockmeter client.\n" \
 "\n" \
 "[client_args]:\n" \
 "   -tx [h] [p]:\n" \
 "   -rx [h] [p]:\n" \
-"   -txrx [h] [p]: Send/receive to/from host h at port p.\n" \
-"                  Pass multiple times to send/receive data to/from\n" \
-"                  multiple peers.\n" \
-"   -t [#]: Total milliseconds (if not passed, one request is processed).\n" \
-"   -nsock [#]: number of sockets.\n" \
-"   -nthread [#]: number of threads.\n" \
-"   -iosize [#]: Size of buffer passed in each socket send/recv call.\n" \
-"   -reqsize [#]: bytes transferred per request.\n" \
-"   -sbuf [#]: Set SO_SNDBUF to [#] on each socket.\n" \
-"   -rbuf [#]: Set SO_RCVBUF to [#] on each socket.\n" \
+"   -txrx [h] [p]:\n" \
+"         Connect to host h at port p.\n" \
+"         Pass multiple times to connect to multiple hosts.\n" \
+"   -t [#]: How long to run in milliseconds. If not passed, a single request\n" \
+"           is issued on each connection.\n" \
+"   -reqsize [#]: bytes transferred per request (default: 16MB).\n" \
+"   -nsock [#]: number of sockets (default: 1).\n" \
+"   -nthread [#]: number of threads (default: 1).\n" \
+"   -iosize [#]: Bytes passed in each send/recv (default: 64KB).\n" \
+"   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
+"   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
 "\n" \
 "Examples:\n" \
 "   sockmeter -svc 30000\n" \
@@ -144,12 +148,13 @@ int sm_iosize = 65535;  // 64KB default
 int sm_sbuf = -1;
 int sm_rbuf = -1;
 BOOLEAN svcmode = FALSE;
+int sm_ncpu = 0;
 
 // Variables for client only:
 SM_PEER* sm_peers = NULL;
-ULONG64 sm_reqsize = 16000000;  // 16MM default
-int sm_nsock = 0;
-int sm_nthread = 0;
+ULONG64 sm_reqsize = 16000000;  // 16MB default
+int sm_nsock = 1;
+int sm_nthread = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 
@@ -869,12 +874,9 @@ void sm_service(void)
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
 
-    SYSTEM_INFO sysinfo;
-    GetSystemInfo(&sysinfo);
-    DWORD num_threads = min(sysinfo.dwNumberOfProcessors, 64);
-    printf(
-        "NumberOfProcessors = %lu; Creating %lu threads\n",
-        sysinfo.dwNumberOfProcessors, num_threads);
+    DWORD num_threads = min(sm_ncpu, 64);
+    printf("NumberOfProcessors = %lu; Creating %lu threads\n",
+           sm_ncpu, num_threads);
     for (DWORD i = 0; i < num_threads; i++) {
         sm_new_thread(sm_service_fn);
     }
@@ -1017,13 +1019,15 @@ void sm_client(void)
             thread = thread->next;
         }
         printf(
-            "\nthreads: %d\n"
+            "\ncpus: %d\n"
+            "threads: %d\n"
             "sockets: %d\n"
             "dt_ms: %llu\n"
             "tx_bytes: %llu\n"
             "tx_Mbps: %llu\n"
             "rx_bytes: %llu\n"
             "rx_Mbps: %llu\n",
+            sm_ncpu,
             sm_nthread,
             sm_nsock,
             t_elapsed_ms,
@@ -1047,6 +1051,35 @@ int __cdecl wmain(int argc, wchar_t** argv)
     } else if (argc == 2 && !wcscmp(argv[1], L"-v")) {
         printf("%s\n", VERSION);
         goto exit;
+    }
+
+    {
+        // Get info on the CPU. Here we use GetLogicalProcessorInformationEx
+        // instead of GetSystemInfo so we can get a full count of logical
+        // processors rather than just the count of logical processors in
+        // sockmeter's assigned processor group.
+        //
+        // TODO: use RelationNumaNodeEx and build a list of nodes rather than
+        // just counting the processors.
+        DWORD cpuinfo_len = 0;
+        GetLogicalProcessorInformationEx(RelationGroup, NULL, &cpuinfo_len);
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* cpuinfo = malloc(cpuinfo_len);
+        if (cpuinfo == NULL) {
+            err = ERROR_NOT_ENOUGH_MEMORY;
+            printf("failed to allocate cpuinfo\n");
+            goto exit;
+        }
+        if (!GetLogicalProcessorInformationEx(
+                RelationGroup, cpuinfo, &cpuinfo_len)) {
+            err = GetLastError();
+            printf("GetLogicalProcessorInformationEx failed with %d\n", err);
+            free(cpuinfo);
+            goto exit;
+        }
+        for (int i = 0; i < cpuinfo->Group.ActiveGroupCount; i++) {
+            sm_ncpu += cpuinfo->Group.GroupInfo[i].MaximumProcessorCount;
+        }
+        free(cpuinfo);
     }
 
     err = WSAStartup(MAKEWORD(2,0), (LPWSADATA)&wd);
@@ -1141,30 +1174,16 @@ int __cdecl wmain(int argc, wchar_t** argv)
     if (svcmode) {
         sm_service();
     } else {
-        if (sm_nthread == 0) {
-            printf("ERROR: Must pass -nthread.\n");
-            err = ERROR_INVALID_PARAMETER;
-            goto exit;
-        }
-        if (sm_nsock == 0) {
-            printf("ERROR: Must pass -nsock.\n");
-            err = ERROR_INVALID_PARAMETER;
-            goto exit;
-        }
         if (numpeers == 0) {
             printf("ERROR: Must pass (-tx or -rx or -txrx) at least once\n");
             err = ERROR_INVALID_PARAMETER;
             goto exit;
         }
         if (sm_nthread > sm_nsock) {
-            printf("ERROR: Cannot have more threads than sockets.\n");
-            err = ERROR_INVALID_PARAMETER;
-            goto exit;
+            sm_nsock = sm_nthread;
         }
         if (numpeers > sm_nsock) {
-            printf("ERROR: Cannot have more peers than sockets.\n");
-            err = ERROR_INVALID_PARAMETER;
-            goto exit;
+            sm_nsock = numpeers;
         }
         sm_client();
     }
