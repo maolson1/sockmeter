@@ -72,8 +72,7 @@ TODO:
 "   sockmeter -svc 30000\n" \
 "   sockmeter -nsock 100 -nthread 4 -tx 127.0.0.1 30000 -rx pc2 30001\n"
 
-// #define DEVBUILD
-#ifdef DEVBUILD
+#ifdef _DEBUG
     #define DEVTRACE printf
 #else
     #define DEVTRACE(...)
@@ -122,6 +121,7 @@ typedef struct _SM_CONN {
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
     ULONG64 to_xfer;
+    ULONG64 req_start_us;
 } SM_CONN;
 
 typedef struct _SM_THREAD {
@@ -133,6 +133,8 @@ typedef struct _SM_THREAD {
     ULONG64 xferred_rx; // sum of bytes rx'd by completed reqs.
     SM_CONN* conns;
     ULONG numconns;
+    ULONG64 reqlatency;
+    ULONG64 numreqs;
 } SM_THREAD;
 
 // Variables for both client and service:
@@ -155,7 +157,7 @@ BOOLEAN sm_cleanup_time = FALSE;
 SOCKADDR_INET sm_svcaddr = {0};
 size_t sm_svcaddrlen = 0;
 
-ULONG64 sm_curtime_ms(void)
+inline ULONG64 sm_curtime_us(void)
 {
     static ULONG64 sm_perf_freq = 0; // ticks/sec
     if (sm_perf_freq == 0) {
@@ -171,7 +173,15 @@ ULONG64 sm_curtime_ms(void)
         printf("QueryPerformanceCounter failed with %d\n", GetLastError());
         return 0;
     }
-    return ticks * 1000 / sm_perf_freq;
+    return ticks * 1000000 / sm_perf_freq;
+}
+
+inline void sm_mean(ULONG64* to, ULONG64* to_n, ULONG64 from, ULONG64 from_n)
+{
+    // Merge two means.
+    // "to" is a mean of "to_n" values; "from" is a mean of "from_n" values.
+    *to = (*to * *to_n + from * from_n) / (*to_n + from_n);
+    *to_n += from_n;
 }
 
 SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
@@ -521,6 +531,8 @@ int sm_issue_req(SM_CONN* conn)
 
     conn->to_xfer = req->to_xfer;
 
+    conn->req_start_us = sm_curtime_us();
+
     conn->io_tx->to_xfer = sizeof(SM_REQ);
     err = sm_send(conn, 0, sizeof(SM_REQ));
     if (err != NO_ERROR) {
@@ -646,7 +658,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             }
 
             io->xferred += xferred;
-            *conn_dir_xferred += xferred;
+            *conn_dir_xferred += (ULONG64)xferred; // TODO: this cast?
             DEVTRACE("conn_dir_xferred now %llu\n", *conn_dir_xferred);
 
             if (io->xferred < io->to_xfer) {
@@ -692,6 +704,13 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     // a new req or close the connection.
 
                     DEVTRACE("finished req\n");
+
+                    if (!svcmode) {
+                        ULONG64 reqlatency =
+                            sm_curtime_us() - conn->req_start_us;
+                        sm_mean(&thread->reqlatency, &thread->numreqs,
+                                reqlatency, 1);
+                    }
 
                     thread->xferred_tx += conn->xferred_tx;
                     conn->xferred_tx = 0;
@@ -959,7 +978,7 @@ void sm_client(void)
 
     printf("Testing...\n");
 
-    ULONG64 t_start_ms = sm_curtime_ms();
+    ULONG64 t_start_us = sm_curtime_us();
 
     // Assign conns to threads and peers round-robin.
 
@@ -991,45 +1010,48 @@ void sm_client(void)
         thread = thread->next;
     }
 
-    ULONG64 t_end_ms = sm_curtime_ms();
-    ULONG64 t_elapsed_ms = t_end_ms - t_start_ms;
+    ULONG64 t_end_us = sm_curtime_us();
+    ULONG64 t_elapsed_us = t_end_us - t_start_us;
 
     printf("Finished.\n");
 
-    if (t_elapsed_ms == 0) {
-        printf(
-            "Transfer duration less than 1ms; must be longer"
-            " to compute metrics.\n");
-    } else {
-        ULONG64 xferred_tx = 0;
-        ULONG64 xferred_rx = 0;
-        thread = sm_threads;
-        while (thread != NULL) {
-            if (thread->conns != NULL) {
-                printf("unexpected: thread still has active conns\n");
-            }
-            xferred_tx += thread->xferred_tx;
-            xferred_rx += thread->xferred_rx;
-            thread = thread->next;
+    ULONG64 xferred_tx = 0;
+    ULONG64 xferred_rx = 0;
+    ULONG64 reqlatency = 0;
+    ULONG64 numreqs = 0;
+    thread = sm_threads;
+    while (thread != NULL) {
+        if (thread->conns != NULL) {
+            printf("unexpected: thread still has active conns\n");
         }
-        printf(
-            "\ncpus: %d\n"
-            "threads: %d\n"
-            "sockets: %d\n"
-            "dt_ms: %llu\n"
-            "tx_bytes: %llu\n"
-            "tx_Mbps: %llu\n"
-            "rx_bytes: %llu\n"
-            "rx_Mbps: %llu\n",
-            sm_ncpu,
-            sm_nthread,
-            sm_nsock,
-            t_elapsed_ms,
-            (ULONG64)xferred_tx,
-            (xferred_tx * 8) / (t_elapsed_ms * 1000),
-            (ULONG64)xferred_rx,
-            (xferred_rx * 8) / (t_elapsed_ms * 1000));
+        xferred_tx += thread->xferred_tx;
+        xferred_rx += thread->xferred_rx;
+        sm_mean(&reqlatency, &numreqs, thread->reqlatency, thread->numreqs);
+        thread = thread->next;
     }
+    printf(
+        "\ncpus: %d\n"
+        "threads: %d\n"
+        "sockets: %d\n"
+        "runtime_ms: %llu\n"
+        "req_bytes: %llu\n"
+        "req_count: %llu\n"
+        "req_avg_us: %llu\n"
+        "tx_bytes: %llu\n"
+        "tx_Mbps: %llu\n"
+        "rx_bytes: %llu\n"
+        "rx_Mbps: %llu\n",
+        sm_ncpu,
+        sm_nthread,
+        sm_nsock,
+        t_elapsed_us / 1000,
+        sm_reqsize,
+        numreqs,
+        reqlatency,
+        xferred_tx,
+        (xferred_tx * 8) / (t_elapsed_us),
+        xferred_rx,
+        (xferred_rx * 8) / (t_elapsed_us));
 }
 
 int __cdecl wmain(int argc, wchar_t** argv)

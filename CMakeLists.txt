@@ -22,7 +22,12 @@ target_include_directories(sockmeter PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_compile_options(sockmeter PUBLIC /WX /W4 /sdl /permissive- /guard:cf /Zi)
 
-target_compile_definitions(sockmeter PUBLIC UNICODE _UNICODE)
+target_compile_definitions(sockmeter
+  PUBLIC
+    UNICODE _UNICODE
+  PRIVATE
+    $<$<CONFIG:Debug>:_DEBUG>
+)
 
 target_link_libraries(sockmeter PUBLIC ws2_32)
 
