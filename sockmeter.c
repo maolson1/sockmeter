@@ -505,6 +505,7 @@ int sm_recv(SM_CONN* conn, int offset, int numbytes, int recvflags)
             err = NO_ERROR;
         }
     }
+
 exit:
     return err;
 }
@@ -582,6 +583,12 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 
     while (TRUE) {
 
+        #ifdef _DEBUG
+            if (svcmode) {
+                fflush(stdout);
+            }
+        #endif
+
         if (!GetQueuedCompletionStatus(
                 thread->iocp, (DWORD*)&xferred, (ULONG_PTR*)&conn,
                 (LPOVERLAPPED*)&io, timeout_ms)) {
@@ -590,15 +597,16 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             goto exit;
         }
 
-        DEVTRACE("io (%s) complete, xferred = %d\n",
-            io->dir == SmDirectionSend ? "tx" : "rx", xferred);
+        DEVTRACE("%s compl %d bytes\n",
+                 io->dir == SmDirectionSend ? "tx" : "rx", xferred);
 
         if (xferred == 0) {
-            DEVTRACE("break for xferred == 0; io dir = %d\n", io->dir);
-            break;
-        }
 
-        if (!svcmode && !conn->in_req && io->dir == SmDirectionSend) {
+            // Peer disconnected.
+            DEVTRACE("conn disconnected\n");
+            sm_del_conn(thread, conn);
+
+        } else if (!svcmode && !conn->in_req && io->dir == SmDirectionSend) {
 
             // Req sent.
             DEVTRACE("send req complete\n");
@@ -618,7 +626,6 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
         } else if (svcmode && !conn->in_req && io->dir == SmDirectionRecv) {
 
             // Req received.
-            DEVTRACE("recv req complete\n");
             conn->in_req = TRUE;
 
             if (xferred != sizeof(SM_REQ)) {
@@ -629,6 +636,8 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             SM_REQ* req = (SM_REQ*)conn->io_rx->buf;
             conn->to_xfer = req->to_xfer;
             conn->dir = req->dir;
+            DEVTRACE("recv req complete, to_xfer=%llu, dir=%d\n",
+                     conn->to_xfer, conn->dir);
             if (conn->dir == SmDirectionSend || conn->dir == SmDirectionBoth) {
                 conn->io_tx->to_xfer =
                     (int)min(conn->io_tx->bufsize, conn->to_xfer);
@@ -658,8 +667,9 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             }
 
             io->xferred += xferred;
-            *conn_dir_xferred += (ULONG64)xferred; // TODO: this cast?
-            DEVTRACE("conn_dir_xferred now %llu\n", *conn_dir_xferred);
+            *conn_dir_xferred += xferred;
+            DEVTRACE("now conn_dir_xferred %llu, io->xferred=%lu, io->to_xfer=%lu, conn->to_xfer=%llu\n",
+                *conn_dir_xferred, io->xferred, io->to_xfer, conn->to_xfer);
 
             if (io->xferred < io->to_xfer) {
                 // Continue current buf
@@ -683,6 +693,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     // Partial buf fulfills req
                     io->to_xfer = (DWORD)(conn->to_xfer - *conn_dir_xferred);
                 }
+                io->xferred = 0;
                 if (io->dir == SmDirectionSend) {
                     err = sm_send(conn, 0, io->to_xfer);
                     if (err != NO_ERROR) {
@@ -703,8 +714,6 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     // Finished with req. Record it and either send/recv
                     // a new req or close the connection.
 
-                    DEVTRACE("finished req\n");
-
                     if (!svcmode) {
                         ULONG64 reqlatency =
                             sm_curtime_us() - conn->req_start_us;
@@ -723,14 +732,14 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                         shutdown(conn->sock, SD_BOTH);
                         sm_del_conn(thread, conn);
                     } else {
+                        io->xferred = 0;
+                        conn->in_req = FALSE;
                         if (svcmode) {
-                            conn->in_req = FALSE;
                             err = sm_recv_req(conn);
                             if (err != NO_ERROR) {
                                 goto exit;
                             }
                         } else {
-                            conn->in_req = FALSE;
                             err = sm_issue_req(conn);
                             if (err != NO_ERROR) {
                                 goto exit;
