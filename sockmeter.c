@@ -8,6 +8,9 @@ separately configured; no need to re-run the service on each execution;
 the service uses a single port number.
 
 TODO:
+-get port number from hklm\system\currentcontrolset\services\sockmeter
+    so that the service can be configured to start at boot (in this case
+    the port can't be passed to "sc start" on the command line).
 -add metric: avg packet size
 -add metric: cpu%
 -add metric: req latency
@@ -76,7 +79,7 @@ TODO:
 "Daemon mode:\n" \
 "As an alternative to running the service in an active terminal session,\n" \
 "sockmeter can be started as an actual service:\n" \
-"   sc create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= auto\n" \
+"   sc create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= demand\n" \
 "   sc start sockmeter -svc [p]\n" \
 "The service can then be stopped and deleted with:\n" \
 "   sc stop sockmeter\n" \
