@@ -40,18 +40,19 @@ TODO:
 
 #define USAGE \
 "\nsockmeter version " VERSION "\n" \
-"   Measures network performance.\n" \
-"   Sockmeter client connects to one or more peers running sockmeter\n" \
-"   service. On each connection, the client issues a series of\n" \
-"   requests to send and/or receive data.\n" \
+"\n" \
+"Measures network performance.\n" \
+"Sockmeter client connects to one or more peers running sockmeter\n" \
+"service. On each connection, the client issues a series of\n" \
+"requests to send and/or receive data.\n" \
 "\n" \
 "Usage:\n" \
 "   sockmeter -v\n" \
 "       Print the version.\n" \
 "   sockmeter -svc [p]\n" \
-"       Run sockmeter service, listening on port p.\n" \
+"       Run service, listening on port p. See also \"Daemon mode\" below.\n" \
 "   sockmeter [client_args]\n" \
-"       Run sockmeter client.\n" \
+"       Run client.\n" \
 "\n" \
 "[client_args]:\n" \
 "   -tx [h] [p]:\n" \
@@ -70,7 +71,16 @@ TODO:
 "\n" \
 "Examples:\n" \
 "   sockmeter -svc 30000\n" \
-"   sockmeter -nsock 100 -nthread 4 -tx 127.0.0.1 30000 -rx pc2 30001\n"
+"   sockmeter -nsock 100 -nthread 4 -tx 127.0.0.1 30000 -rx pc2 30001\n" \
+"\n" \
+"Daemon mode:\n" \
+"As an alternative to running the service in an active terminal session,\n" \
+"sockmeter can be started as an actual service:\n" \
+"   sc create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= auto\n" \
+"   sc start sockmeter -svc [p]\n" \
+"The service can then be stopped and deleted with:\n" \
+"   sc stop sockmeter\n" \
+"   sc delete sockmeter\n"
 
 #ifdef _DEBUG
     #define DEVTRACE printf
@@ -154,6 +164,8 @@ int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 
 // Variables for service only:
+SERVICE_STATUS_HANDLE sm_svc_status_handle;
+SERVICE_STATUS sm_svc_status;
 SOCKADDR_INET sm_svcaddr = {0};
 size_t sm_svcaddrlen = 0;
 
@@ -387,7 +399,7 @@ void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
     free(conn);
 }
 
-SM_THREAD* sm_new_thread(LPTHREAD_START_ROUTINE fn)
+SM_THREAD* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
 {
     int err = NO_ERROR;
     SM_THREAD* thread = NULL;
@@ -726,8 +738,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     thread->xferred_rx += conn->xferred_rx;
                     conn->xferred_rx = 0;
 
-                    if (!svcmode &&
-                        (sm_cleanup_time || sm_durationms == 0)) {
+                    if (sm_cleanup_time || (!svcmode && sm_durationms == 0)) {
                         DEVTRACE("shutting down conn\n");
                         shutdown(conn->sock, SD_BOTH);
                         sm_del_conn(thread, conn);
@@ -879,7 +890,7 @@ exit:
     return conn;
 }
 
-DWORD sm_service_fn(void* param)
+DWORD sm_service_io_fn(void* param)
 {
     while (TRUE) {
         sm_io_loop((SM_THREAD*)param, INFINITE);
@@ -887,14 +898,15 @@ DWORD sm_service_fn(void* param)
     return 0;
 }
 
-void sm_service(void)
+DWORD sm_service_fn(void* param)
 {
+    UNREFERENCED_PARAMETER(param);
     int err = NO_ERROR;
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
 
     for (int i = 0; i < sm_nthread; i++) {
-        sm_new_thread(sm_service_fn);
+        sm_new_io_thread(sm_service_io_fn);
     }
 
     ls = WSASocket(
@@ -951,6 +963,13 @@ void sm_service(void)
 
     thread = sm_threads;
     while (TRUE) {
+
+        // TODO: how to break out of accept when service stops?
+        // For now, just break out the next time we return from accept.
+        if (sm_cleanup_time) {
+            goto exit;
+        }
+
         SM_CONN* conn = sm_accept_conn(ls, thread);
         if (conn == NULL) {
             goto exit;
@@ -965,9 +984,10 @@ exit:
     if (ls != INVALID_SOCKET) {
         closesocket(ls);
     }
+    return err;
 }
 
-DWORD sm_client_fn(void* param)
+DWORD sm_client_io_fn(void* param)
 {
     return sm_io_loop((SM_THREAD*)param, 5000);
 }
@@ -979,7 +999,7 @@ void sm_client(void)
     SM_PEER* peer = NULL;
 
     for (int i = 0; i < sm_nthread; i++) {
-        thread = sm_new_thread(sm_client_fn);
+        thread = sm_new_io_thread(sm_client_io_fn);
         if (thread == NULL) {
             return;
         }
@@ -1063,7 +1083,7 @@ void sm_client(void)
         (xferred_rx * 8) / (t_elapsed_us));
 }
 
-int __cdecl wmain(int argc, wchar_t** argv)
+int realmain(int argc, wchar_t** argv)
 {
     int err = 0;
     BOOLEAN need_wsacleanup = FALSE;
@@ -1121,7 +1141,9 @@ int __cdecl wmain(int argc, wchar_t** argv)
     while (ac < argc) {
         wchar_t** name = av++; ac++;
         int argsleft = argc - ac;
-        if (argsleft >= 1 && !wcscmp(*name, L"-svc")) {
+        if (argsleft >= 1 &&
+                (!wcscmp(*name, L"-svc") ||
+                 !wcscmp(*name, L"-d"))) {
             IN6ADDR_SETANY((SOCKADDR_IN6*)&sm_svcaddr);
             SS_PORT(&sm_svcaddr) = htons((USHORT)_wtoi(*av));
             sm_svcaddrlen = SOCKADDR_SIZE(AF_INET6);
@@ -1174,6 +1196,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
             numpeers++;
             av += 2; ac += 2;
         } else {
+            DEVTRACE("realmain: invalid parameter, argsleft=%d\n", argsleft);
             printf(USAGE);
             err = ERROR_INVALID_PARAMETER;
             goto exit;
@@ -1202,7 +1225,7 @@ int __cdecl wmain(int argc, wchar_t** argv)
         if (!nthread_passed) {
             sm_nthread = min(sm_ncpu, 64);
         }
-        sm_service();
+        sm_service_fn(NULL);
     } else {
         if (numpeers == 0) {
             printf("ERROR: Must pass (-tx or -rx or -txrx) at least once\n");
@@ -1231,5 +1254,67 @@ exit:
         WSACleanup();
     }
 
+    return err;
+}
+
+void WINAPI svc_ctrl(DWORD code)
+{
+    printf("svc_ctrl, code = %d\n", code);
+    fflush(stdout);
+    if (code == SERVICE_CONTROL_STOP) {
+        sm_cleanup_time = TRUE;
+        sm_svc_status.dwCurrentState = SERVICE_STOP_PENDING;
+        sm_svc_status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+        sm_svc_status.dwWin32ExitCode = NO_ERROR;
+        SetServiceStatus(sm_svc_status_handle, &sm_svc_status);
+    }
+}
+
+void WINAPI svc_main(DWORD argc, wchar_t** argv)
+{
+    sm_svc_status_handle = RegisterServiceCtrlHandlerW(L"sockmeter", svc_ctrl);
+    sm_svc_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+    sm_svc_status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+
+    // We're not really set up yet. But we'll be fast...
+    // Report SERVICE_START_PENDING here with an appropriate
+    // dwWaitHint and only claim to be RUNNING once we really are,
+    // if that becomes necessary. (Also make sure to not indicate
+    // dwControlsAccepted=SERVICE_ACCEPT_STOP while we are in
+    // SERVICE_START_PENDING state).
+
+    sm_svc_status.dwCurrentState = SERVICE_RUNNING;
+    sm_svc_status.dwWin32ExitCode = NO_ERROR;
+    SetServiceStatus(sm_svc_status_handle, &sm_svc_status);
+
+    #ifdef _DEBUG
+    FILE* f;
+    freopen_s(&f, "C:\\sockmeter-svc-log.txt", "w", stdout);
+    #endif
+
+    realmain(argc, argv);
+
+    printf("svc_main exiting\n");
+    fflush(stdout);
+
+    sm_svc_status.dwCurrentState = SERVICE_STOPPED;
+    sm_svc_status.dwWin32ExitCode = NO_ERROR;
+    SetServiceStatus(sm_svc_status_handle, &sm_svc_status);
+}
+
+int __cdecl wmain(int argc, wchar_t** argv)
+{
+    int err = NO_ERROR;
+    if (argc == 2 && !wcscmp(argv[1], L"-d")) {
+        SERVICE_TABLE_ENTRYW svctable[] = {{L"", svc_main}, {NULL, NULL}};
+        if (!StartServiceCtrlDispatcherW(svctable)) {
+            err = GetLastError();
+            if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+                printf("Don't pass -d from command line! See help text and use sc.exe.\n");
+            }
+        }
+    } else {
+        err = realmain(argc, argv);
+    }
     return err;
 }
