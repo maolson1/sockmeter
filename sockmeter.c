@@ -79,11 +79,11 @@ TODO:
 "Daemon mode:\n" \
 "As an alternative to running the service in an active terminal session,\n" \
 "sockmeter can be started as an actual service:\n" \
-"   sc create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= demand\n" \
-"   sc start sockmeter -svc [p]\n" \
+"   sc.exe create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= demand\n" \
+"   sc.exe start sockmeter -svc [p]\n" \
 "The service can then be stopped and deleted with:\n" \
-"   sc stop sockmeter\n" \
-"   sc delete sockmeter\n"
+"   sc.exe stop sockmeter\n" \
+"   sc.exe delete sockmeter\n"
 
 #ifdef _DEBUG
     #define DEVTRACE printf
