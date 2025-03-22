@@ -8,9 +8,6 @@ separately configured; no need to re-run the service on each execution;
 the service uses a single port number.
 
 TODO:
--get port number from hklm\system\currentcontrolset\services\sockmeter
-    so that the service can be configured to start at boot (in this case
-    the port can't be passed to "sc start" on the command line).
 -add metric: avg packet size
 -add metric: cpu%
 -add metric: req latency
@@ -26,6 +23,7 @@ TODO:
     RSS processors and assigning conns to threads based on the output of
     SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
 -cmdline args to force v4/6 when using hostnames
+-allow a single service instance to listen on multiple ports
 */
 
 #define WIN32_LEAN_AND_MEAN 1
@@ -45,23 +43,27 @@ TODO:
 "\nsockmeter version " VERSION "\n" \
 "\n" \
 "Measures network performance.\n" \
-"Sockmeter client connects to one or more peers running sockmeter\n" \
-"service. On each connection, the client issues a series of\n" \
-"requests to send and/or receive data.\n" \
+"Sockmeter client connects to one or more sockmeter services.\n" \
+"On each connection, the client issues a series of requests\n" \
+"to send and/or receive data.\n" \
 "\n" \
 "Usage:\n" \
 "   sockmeter -v\n" \
 "       Print the version.\n" \
-"   sockmeter -svc [p]\n" \
-"       Run service, listening on port p. See also \"Daemon mode\" below.\n" \
 "   sockmeter [client_args]\n" \
 "       Run client.\n" \
+"   sockmeter -svc [p]\n" \
+"       Start service, listening on port p.\n" \
+"   sockmeter -delsvc\n" \
+"       Delete existing sockmeter service.\n" \
+"   sockmeter -listen [p]\n" \
+"       Like -svc, but run in current shell rather than a service process.\n" \
 "\n" \
 "[client_args]:\n" \
 "   -tx [h] [p]:\n" \
 "   -rx [h] [p]:\n" \
 "   -txrx [h] [p]:\n" \
-"         Connect to host h at port p.\n" \
+"         Connect to host h at port p. h can be a hostname or IP address.\n" \
 "         Pass multiple times to connect to multiple hosts.\n" \
 "   -t [#]: How long to run in milliseconds. If not passed, a single request\n" \
 "           is issued on each connection.\n" \
@@ -72,18 +74,11 @@ TODO:
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
 "\n" \
-"Examples:\n" \
+"Example:\n" \
 "   sockmeter -svc 30000\n" \
-"   sockmeter -nsock 100 -nthread 4 -tx 127.0.0.1 30000 -rx pc2 30001\n" \
-"\n" \
-"Daemon mode:\n" \
-"As an alternative to running the service in an active terminal session,\n" \
-"sockmeter can be started as an actual service:\n" \
-"   sc.exe create sockmeter binPath= \"C:\\sockmeter.exe -d\" start= demand\n" \
-"   sc.exe start sockmeter -svc [p]\n" \
-"The service can then be stopped and deleted with:\n" \
-"   sc.exe stop sockmeter\n" \
-"   sc.exe delete sockmeter\n"
+"   sockmeter -tx localhost 30000 -rx localhost 30000 -nsock 20\n" \
+"   sockmeter -delsvc\n" \
+"\n"
 
 #ifdef _DEBUG
     #define DEVTRACE printf
@@ -175,6 +170,7 @@ SOCKADDR_INET sm_svcaddr = {0};
 size_t sm_svcaddrlen = 0;
 HANDLE sm_accept_iocp = NULL;
 #define SM_ACCEPT_KEY_CLEANUP_TIME 1
+#define SM_SERVICE_NAME L"sockmeter"
 
 inline ULONG64 sm_curtime_us(void)
 {
@@ -1078,7 +1074,7 @@ void sm_client(void)
         }
     }
 
-    printf("Testing...\n");
+    printf("Running... ");
 
     ULONG64 t_start_us = sm_curtime_us();
 
@@ -1217,8 +1213,8 @@ int realmain(int argc, wchar_t** argv)
         wchar_t** name = av++; ac++;
         int argsleft = argc - ac;
         if (argsleft >= 1 &&
-                (!wcscmp(*name, L"-svc") ||
-                 !wcscmp(*name, L"-d"))) {
+                (!wcscmp(*name, L"-listen") ||
+                 !wcscmp(*name, L"-svclisten"))) {
             IN6ADDR_SETANY((SOCKADDR_IN6*)&sm_svcaddr);
             SS_PORT(&sm_svcaddr) = htons((USHORT)_wtoi(*av));
             sm_svcaddrlen = SOCKADDR_SIZE(AF_INET6);
@@ -1332,6 +1328,175 @@ exit:
     return err;
 }
 
+int sm_start_svc(int argc, wchar_t** argv)
+{
+    // NB: assumes argc == 3
+
+    int err = NO_ERROR;
+    SC_HANDLE svc_handle = NULL;
+    SC_HANDLE scm_handle = NULL;
+    SERVICE_STATUS svc_status = {0};
+    // args for starting the service are "-svc [p]"; change this to the
+    // args expected by the service: "-svclisten [p]".
+    wchar_t* modified_argv[3] = {argv[0], L"-svclisten", argv[2]};
+    wchar_t* cmdline = NULL;
+
+    scm_handle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (scm_handle == NULL) {
+        err = GetLastError();
+        if (err == ERROR_ACCESS_DENIED) {
+            printf("ERROR_ACCESS_DENIED- must start service as admin.\n");
+        } else {
+            printf("OpenSCManager failed with %d\n", err);
+        }
+        goto exit;
+    }
+
+    svc_handle = OpenService(scm_handle, SM_SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (svc_handle == NULL) {
+        err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+
+            // NB- this cmdline is used for autostart. For demand start
+            // the args passed to StartService are used instead.
+            size_t cmdline_len = 0;
+            for (int i = 0; i < argc; i++) {
+                cmdline_len += wcslen(modified_argv[i]) + 1;
+            }
+            cmdline = malloc(cmdline_len * sizeof(wchar_t));
+            if (cmdline == NULL) {
+                printf("Could not allocate cmdline for CreateService\n");
+                err = ERROR_NOT_ENOUGH_MEMORY;
+                goto exit;
+            }
+            cmdline[0] = L'\0';
+            for (int i = 0; i < argc - 1; i++) {
+                wcscat_s(cmdline, cmdline_len, modified_argv[i]);
+                wcscat_s(cmdline, cmdline_len, L" ");
+            }
+            wcscat_s(cmdline, cmdline_len, modified_argv[argc - 1]);
+
+            svc_handle = CreateService(
+                scm_handle, SM_SERVICE_NAME, SM_SERVICE_NAME,
+                SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
+                SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, cmdline,
+                NULL, NULL, NULL, NULL, NULL);
+            if (svc_handle == NULL) {
+                err = GetLastError();
+                printf("CreateService failed with %d\n", err);
+                goto exit;
+            }
+        } else {
+            printf("OpenService failed with %d\n", err);
+            goto exit;
+        }
+    }
+
+    if (!QueryServiceStatus(svc_handle, &svc_status)) {
+        err = GetLastError();
+        printf("QueryServiceStatus failed with %d\n", err);
+        goto exit;
+    }
+
+    if (svc_status.dwCurrentState == SERVICE_STOPPED) {
+        printf("Starting service.\n");
+        if (!StartService(svc_handle, argc - 1, modified_argv + 1)) {
+            err = GetLastError();
+            printf("StartService failed with %d\n", err);
+            goto exit;
+        }
+    } else if (svc_status.dwCurrentState == SERVICE_RUNNING) {
+        printf("Sockmeter service is already running.\n");
+        printf("Run -delsvc first if you want to start with a new configuration.\n");
+        err = 1;
+        goto exit;
+    }
+
+exit:
+    if (cmdline != NULL) {
+        free(cmdline);
+    }
+    if (svc_handle != NULL) {
+        CloseServiceHandle(svc_handle);
+    }
+    if (scm_handle != NULL) {
+        CloseServiceHandle(scm_handle);
+    }
+    return err;
+}
+
+int sm_del_svc(void)
+{
+    int err = NO_ERROR;
+    SC_HANDLE svc_handle = NULL;
+    SC_HANDLE scm_handle = NULL;
+    SERVICE_STATUS svc_status = {0};
+
+    scm_handle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
+    if (scm_handle == NULL) {
+        err = GetLastError();
+        if (err == ERROR_ACCESS_DENIED) {
+            printf("ERROR_ACCESS_DENIED- must delete service as admin.\n");
+        } else {
+            printf("OpenSCManager failed with %d\n", err);
+        }
+        goto exit;
+    }
+
+    svc_handle = OpenService(scm_handle, SM_SERVICE_NAME, SERVICE_ALL_ACCESS);
+    if (svc_handle == NULL) {
+        err = GetLastError();
+        if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
+            printf("Sockmeter service is not running.\n");
+            err = NO_ERROR;
+        } else {
+            printf("OpenService failed with %d\n", err);
+        }
+        goto exit;
+    }
+
+    if (!ControlService(svc_handle, SERVICE_CONTROL_STOP, &svc_status)) {
+        err = GetLastError();
+        if (err == ERROR_SERVICE_NOT_ACTIVE) {
+            // already stopped.
+            err = NO_ERROR;
+            goto delsvc;
+        }
+        printf("ControlService failed with %d\n", err);
+    }
+
+    while (QueryServiceStatus(svc_handle, &svc_status)) {
+        if (svc_status.dwCurrentState != SERVICE_STOP_PENDING) {
+            break;
+        }
+        Sleep(500);
+    }
+
+    if (svc_status.dwCurrentState != SERVICE_STOPPED) {
+        printf("Failed to stop sockmeter service.\n");
+        err = 1;
+        goto exit;
+    }
+
+delsvc:
+    if (!DeleteService(svc_handle)) {
+        err = GetLastError();
+        printf("DeleteService failed with %d\n", err);
+        goto exit;
+    }
+
+    printf("Stopped sockmeter service.\n");
+
+exit:
+    if (svc_handle != NULL) {
+        CloseServiceHandle(svc_handle);
+    }
+    if (scm_handle != NULL) {
+        CloseServiceHandle(scm_handle);
+    }
+    return err;
+}
+
 void WINAPI svc_ctrl(DWORD code)
 {
     printf("svc_ctrl, code = %d\n", code);
@@ -1353,7 +1518,8 @@ void WINAPI svc_ctrl(DWORD code)
 
 void WINAPI svc_main(DWORD argc, wchar_t** argv)
 {
-    sm_svc_status_handle = RegisterServiceCtrlHandlerW(L"sockmeter", svc_ctrl);
+    sm_svc_status_handle =
+        RegisterServiceCtrlHandlerW(SM_SERVICE_NAME, svc_ctrl);
     sm_svc_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     sm_svc_status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
 
@@ -1386,12 +1552,16 @@ void WINAPI svc_main(DWORD argc, wchar_t** argv)
 int __cdecl wmain(int argc, wchar_t** argv)
 {
     int err = NO_ERROR;
-    if (argc == 2 && !wcscmp(argv[1], L"-d")) {
+    if (argc == 2 && !wcscmp(argv[1], L"-delsvc")) {
+        err = sm_del_svc();
+    } else if (argc == 3 && !wcscmp(argv[1], L"-svc")) {
+        err = sm_start_svc(argc, argv);
+    } else if (argc == 3 && !wcscmp(argv[1], L"-svclisten")) {
         SERVICE_TABLE_ENTRYW svctable[] = {{L"", svc_main}, {NULL, NULL}};
         if (!StartServiceCtrlDispatcherW(svctable)) {
             err = GetLastError();
             if (err == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
-                printf("Don't pass -d from command line! See help text and use sc.exe.\n");
+                printf("Don't pass -svclisten from command line!\n");
             }
         }
     } else {
