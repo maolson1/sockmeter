@@ -1338,8 +1338,17 @@ int sm_start_svc(int argc, wchar_t** argv)
     SERVICE_STATUS svc_status = {0};
     // args for starting the service are "-svc [p]"; change this to the
     // args expected by the service: "-svclisten [p]".
-    wchar_t* modified_argv[3] = {argv[0], L"-svclisten", argv[2]};
+    wchar_t abspath[MAX_PATH + 2];
+    wchar_t* modified_argv[3] = {abspath, L"-svclisten", argv[2]};
     wchar_t* cmdline = NULL;
+
+    abspath[0] = L'\"'; // wrap in quotes in case of spaces in path.
+    if (!GetModuleFileName(NULL, abspath + 1, MAX_PATH)) {
+        err = GetLastError();
+        printf("GetModuleFileName failed with %d\n", err);
+        goto exit;
+    }
+    wcscat_s(abspath, MAX_PATH + 2, L"\"");
 
     scm_handle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (scm_handle == NULL) {
