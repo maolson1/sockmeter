@@ -173,6 +173,8 @@ SERVICE_STATUS_HANDLE sm_svc_status_handle;
 SERVICE_STATUS sm_svc_status;
 SOCKADDR_INET sm_svcaddr = {0};
 size_t sm_svcaddrlen = 0;
+HANDLE sm_accept_iocp = NULL;
+#define SM_ACCEPT_KEY_CLEANUP_TIME 1
 
 inline ULONG64 sm_curtime_us(void)
 {
@@ -854,7 +856,7 @@ exit:
     return err;
 }
 
-SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread, HANDLE accept_iocp)
+SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
 {
     int err = NO_ERROR;
     SM_CONN* conn = NULL;
@@ -884,9 +886,13 @@ SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread, HANDLE accept_iocp)
     LPOVERLAPPED pov = NULL;
     ULONG_PTR key = 0;
     if (!GetQueuedCompletionStatus(
-            accept_iocp, &xferred, &key, &pov, INFINITE)) {
+            sm_accept_iocp, &xferred, &key, &pov, INFINITE)) {
         err = GetLastError();
-        printf("GetQueuedCompletionStatus (accept_iocp) failed with %d\n", err);
+        printf("GetQueuedCompletionStatus (accept iocp) failed with %d\n", err);
+        goto exit;
+    }
+    if (key == SM_ACCEPT_KEY_CLEANUP_TIME) {
+        err = 1;
         goto exit;
     }
 
@@ -940,10 +946,9 @@ DWORD sm_service_fn(void* param)
     int err = NO_ERROR;
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
-    HANDLE accept_iocp = NULL;
 
-    accept_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    if (accept_iocp == NULL) {
+    sm_accept_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (sm_accept_iocp == NULL) {
         err = GetLastError();
         printf("CreateIoCompletionPort failed with %d\n", err);
         goto exit;
@@ -968,7 +973,7 @@ DWORD sm_service_fn(void* param)
     }
 
     if (CreateIoCompletionPort(
-            (HANDLE)ls, accept_iocp, (ULONG_PTR)NULL, 0) == NULL) {
+            (HANDLE)ls, sm_accept_iocp, (ULONG_PTR)NULL, 0) == NULL) {
         err = GetLastError();
         printf("Associating listen sock to iocp failed with %d\n", err);
         goto exit;
@@ -1035,7 +1040,7 @@ DWORD sm_service_fn(void* param)
             goto exit;
         }
 
-        SM_CONN* conn = sm_accept_conn(ls, thread, accept_iocp);
+        SM_CONN* conn = sm_accept_conn(ls, thread);
         if (conn == NULL) {
             goto exit;
         }
@@ -1049,8 +1054,8 @@ exit:
     if (ls != INVALID_SOCKET) {
         closesocket(ls);
     }
-    if (accept_iocp != NULL) {
-        CloseHandle(accept_iocp);
+    if (sm_accept_iocp != NULL) {
+        CloseHandle(sm_accept_iocp);
     }
     return err;
 }
@@ -1330,14 +1335,20 @@ exit:
 void WINAPI svc_ctrl(DWORD code)
 {
     printf("svc_ctrl, code = %d\n", code);
-    fflush(stdout);
     if (code == SERVICE_CONTROL_STOP) {
         sm_cleanup_time = TRUE;
         sm_svc_status.dwCurrentState = SERVICE_STOP_PENDING;
         sm_svc_status.dwControlsAccepted = SERVICE_ACCEPT_STOP;
         sm_svc_status.dwWin32ExitCode = NO_ERROR;
         SetServiceStatus(sm_svc_status_handle, &sm_svc_status);
+
+        if (!PostQueuedCompletionStatus(
+                sm_accept_iocp, 0, SM_ACCEPT_KEY_CLEANUP_TIME, NULL)) {
+            int err = GetLastError();
+            printf("PostQueuedCompletionStatus failed with %d\n", err);
+        }
     }
+    fflush(stdout);
 }
 
 void WINAPI svc_main(DWORD argc, wchar_t** argv)
