@@ -158,6 +158,8 @@ int sm_sbuf = -1;
 int sm_rbuf = -1;
 BOOLEAN svcmode = FALSE;
 int sm_ncpu = 0;
+GUID acceptex_guid = WSAID_ACCEPTEX;
+LPFN_ACCEPTEX AcceptExFn;
 
 // Variables for client only:
 SM_PEER* sm_peers = NULL;
@@ -852,15 +854,46 @@ exit:
     return err;
 }
 
-SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
+SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread, HANDLE accept_iocp)
 {
     int err = NO_ERROR;
     SM_CONN* conn = NULL;
 
-    SOCKET ss = accept(ls, NULL, NULL);
-    if (ss == INVALID_SOCKET) {
+    SOCKET ss = WSASocket(
+        AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+    if (ls == INVALID_SOCKET) {
+        printf("socket failed with %d\n", WSAGetLastError());
+        goto exit;
+    }
+
+    OVERLAPPED ov = {0};
+    DWORD xferred = 0;
+    char addrspace[2 * sizeof(SOCKADDR_INET) + 32];
+    if (!AcceptExFn(
+        ls, ss, addrspace, 0, sizeof(addrspace) / 2, sizeof(addrspace) / 2,
+        &xferred, &ov)) {
         err = WSAGetLastError();
-        printf("Accept failed with %d\n", err);
+        if (err != WSA_IO_PENDING) {
+            printf("AcceptEx failed with %d\n", err);
+            goto exit;
+        } else {
+            err = NO_ERROR;
+        }
+    }
+
+    LPOVERLAPPED pov = NULL;
+    ULONG_PTR key = 0;
+    if (!GetQueuedCompletionStatus(
+            accept_iocp, &xferred, &key, &pov, INFINITE)) {
+        err = GetLastError();
+        printf("GetQueuedCompletionStatus (accept_iocp) failed with %d\n", err);
+        goto exit;
+    }
+
+    if (setsockopt(ss, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                   (char*)&ls, sizeof(ls)) == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        printf("setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed with %d\n", err);
         goto exit;
     }
 
@@ -907,6 +940,14 @@ DWORD sm_service_fn(void* param)
     int err = NO_ERROR;
     SOCKET ls = INVALID_SOCKET;
     SM_THREAD* thread = NULL;
+    HANDLE accept_iocp = NULL;
+
+    accept_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (accept_iocp == NULL) {
+        err = GetLastError();
+        printf("CreateIoCompletionPort failed with %d\n", err);
+        goto exit;
+    }
 
     for (int i = 0; i < sm_nthread; i++) {
         sm_new_io_thread(sm_service_io_fn);
@@ -923,6 +964,13 @@ DWORD sm_service_fn(void* param)
     if (setsockopt(
             ls, IPPROTO_IPV6, IPV6_V6ONLY, (char*)&opt, sizeof(opt)) != 0) {
         printf("setsockopt(IPV6_V6ONLY) failed with %d\n", WSAGetLastError());
+        goto exit;
+    }
+
+    if (CreateIoCompletionPort(
+            (HANDLE)ls, accept_iocp, (ULONG_PTR)NULL, 0) == NULL) {
+        err = GetLastError();
+        printf("Associating listen sock to iocp failed with %d\n", err);
         goto exit;
     }
 
@@ -956,6 +1004,20 @@ DWORD sm_service_fn(void* param)
         goto exit;
     }
 
+    // TODO: AcceptEx is actually exported by mswsock.dll. Why is
+    // it documented as needing SIO_GET_EXTENSION_FUNCTION_POINTER?
+    // Follow the docs and use the IOCTL for now to be safe.
+    DWORD bytes_ret = 0;
+    err = WSAIoctl(ls, SIO_GET_EXTENSION_FUNCTION_POINTER,
+                   &acceptex_guid, sizeof(acceptex_guid),
+                   &AcceptExFn, sizeof(AcceptExFn),
+                   &bytes_ret, NULL, NULL);
+    if (err == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        printf("WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER, AcceptEx) failed"
+               " with %d", err);
+        goto exit;
+    }
 
     printf(
         "Started sockmeter service.\n\n"
@@ -973,7 +1035,7 @@ DWORD sm_service_fn(void* param)
             goto exit;
         }
 
-        SM_CONN* conn = sm_accept_conn(ls, thread);
+        SM_CONN* conn = sm_accept_conn(ls, thread, accept_iocp);
         if (conn == NULL) {
             goto exit;
         }
@@ -986,6 +1048,9 @@ DWORD sm_service_fn(void* param)
 exit:
     if (ls != INVALID_SOCKET) {
         closesocket(ls);
+    }
+    if (accept_iocp != NULL) {
+        CloseHandle(accept_iocp);
     }
     return err;
 }
@@ -1067,6 +1132,7 @@ void sm_client(void)
         "sockets: %d\n"
         "runtime_ms: %llu\n"
         "req_bytes: %llu\n"
+        "io_bytes: %d\n"
         "req_count: %llu\n"
         "req_avg_us: %llu\n"
         "tx_bytes: %llu\n"
@@ -1078,6 +1144,7 @@ void sm_client(void)
         sm_nsock,
         t_elapsed_us / 1000,
         sm_reqsize,
+        sm_iosize,
         numreqs,
         reqlatency,
         xferred_tx,
