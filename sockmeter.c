@@ -14,7 +14,6 @@ TODO:
 -write stats to json
 -iofrag option (pass multiple wsabufs to WSASend/WSARecv)
 -reuseconn option (default true; whether to reuse conns for new reqs)
--TCP_NODELAY option
 -service sends back info (cpu% etc)
 -consider SO_LINGER/SO_DONTLINGER
 -pingpong
@@ -878,6 +877,15 @@ int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
         goto exit;
     }
 
+    opt = 1;
+    if (setsockopt(
+            sock, IPPROTO_TCP, TCP_NODELAY, (char*)&opt, sizeof(opt))
+                == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        printf("setsockopt(TCP_NODELAY) failed with %d\n", err);
+        goto exit;
+    }
+
     if (sm_sbuf != -1) {
         if (setsockopt(
                 sock, SOL_SOCKET, SO_SNDBUF, (char*)&sm_sbuf,
@@ -1046,10 +1054,12 @@ DWORD sm_service_fn(void* param)
         goto exit;
     }
 
-    if (CreateIoCompletionPort(
-            (HANDLE)ls, sm_accept_iocp, (ULONG_PTR)NULL, 0) == NULL) {
-        err = GetLastError();
-        printf("Associating listen sock to iocp failed with %d\n", err);
+    opt = 1;
+    if (setsockopt(
+            ls, IPPROTO_TCP, TCP_NODELAY, (char*)&opt, sizeof(opt))
+                == SOCKET_ERROR) {
+        err = WSAGetLastError();
+        printf("setsockopt(TCP_NODELAY) failed with %d\n", err);
         goto exit;
     }
 
@@ -1071,6 +1081,13 @@ DWORD sm_service_fn(void* param)
             printf("setsockopt(SO_RCVBUF) failed with %d\n", err);
             goto exit;
         }
+    }
+
+    if (CreateIoCompletionPort(
+            (HANDLE)ls, sm_accept_iocp, (ULONG_PTR)NULL, 0) == NULL) {
+        err = GetLastError();
+        printf("Associating listen sock to iocp failed with %d\n", err);
+        goto exit;
     }
 
     if (bind(ls, (SOCKADDR*)&sm_svcaddr, (int)sm_svcaddrlen) == SOCKET_ERROR) {
