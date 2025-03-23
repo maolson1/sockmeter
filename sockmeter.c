@@ -126,17 +126,16 @@ typedef struct _SM_IO {
     int bufsize;
 } SM_IO;
 
+typedef enum {
+    SmConnStateRequest,
+    SmConnStatePayload,
+    SmConnStateResponse
+} SM_CONN_STATE;
+
 typedef struct _SM_CONN {
     struct _SM_CONN* next;
     SOCKET sock;
-
-    // State machine:
-    // in_req=0, in_resp=0 - base state.
-    // in_req=1, in_resp=0 - finished sending/receiving request header.
-    // in_req=1, in_resp=1 - finished sending/receiving payload.
-    BOOLEAN in_req; // TRUE if there's an outstanding req.
-    BOOLEAN in_resp; // TRUE if there's an outstanding response.
-
+    SM_CONN_STATE state;
     SM_DIRECTION dir;
     SM_IO* io_tx;
     SM_IO* io_rx;
@@ -370,8 +369,7 @@ SM_CONN* sm_new_conn(SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir)
     conn->xferred_tx = 0;
     conn->xferred_rx = 0;
     conn->dir = dir;
-    conn->in_req = FALSE;
-    conn->in_resp = FALSE;
+    conn->state = SmConnStateRequest;
 
     EnterCriticalSection(&thread->lock);
     conn->next = thread->conns;
@@ -673,12 +671,11 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             DEVTRACE("conn disconnected\n");
             sm_del_conn(thread, conn);
 
-        } else if (conn->in_resp) {
+        } else if (conn->state == SmConnStateResponse) {
 
-            // Response sent.
+            // Response sent/received.
 
-            conn->in_req = FALSE;
-            conn->in_resp = FALSE;
+            conn->state = SmConnStateRequest;
 
             if (svcmode) {
                 DEVTRACE("send response complete\n");
@@ -716,11 +713,13 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                 }
             }
 
-        } else if (!svcmode && !conn->in_req && io->dir == SmDirectionSend) {
+        } else if (!svcmode &&
+                   conn->state == SmConnStateRequest &&
+                   io->dir == SmDirectionSend) {
 
             // Request sent.
             DEVTRACE("send req complete\n");
-            conn->in_req = TRUE;
+            conn->state = SmConnStatePayload;
 
             if (conn->dir == SmDirectionSend || conn->dir == SmDirectionBoth) {
                 io->xferred = 0;
@@ -733,10 +732,12 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             // NB: We post the initial recv in sm_issue_req, so no need to post
             // it here.
 
-        } else if (svcmode && !conn->in_req && io->dir == SmDirectionRecv) {
+        } else if (svcmode &&
+                   conn->state == SmConnStateRequest &&
+                   io->dir == SmDirectionRecv) {
 
             // Request received.
-            conn->in_req = TRUE;
+            conn->state = SmConnStatePayload;
 
             if (xferred != sizeof(SM_REQ)) {
                 printf("Expected sizeof(SM_REQ) bytes but got %d\n", xferred);
@@ -824,7 +825,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                     // Finished with both directions of payload. Process
                     // the response.
 
-                    conn->in_resp = TRUE;
+                    conn->state = SmConnStateResponse;
 
                     if (svcmode) {
                         err = sm_issue_resp(conn);
@@ -1082,9 +1083,6 @@ DWORD sm_service_fn(void* param)
         goto exit;
     }
 
-    // TODO: AcceptEx is actually exported by mswsock.dll. Why is
-    // it documented as needing SIO_GET_EXTENSION_FUNCTION_POINTER?
-    // Follow the docs and use the IOCTL for now to be safe.
     DWORD bytes_ret = 0;
     err = WSAIoctl(ls, SIO_GET_EXTENSION_FUNCTION_POINTER,
                    &acceptex_guid, sizeof(acceptex_guid),
