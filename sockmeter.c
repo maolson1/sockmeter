@@ -40,6 +40,7 @@ REFERENCE:
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <iphlpapi.h>
+#include <shellapi.h>
 
 #define VERSION "2.0.1"
 
@@ -1556,33 +1557,13 @@ void WINAPI svc_main(DWORD argc, wchar_t** argv)
     // and use that to populate our own argc/argv to pass to realmain.
     UNREFERENCED_PARAMETER(argc);
     UNREFERENCED_PARAMETER(argv);
-    wchar_t* cmdline = GetCommandLine();
-    if (cmdline == NULL) {
-        DEVTRACE("GetCommandLine failed\n");
-        goto exit;
-    }
-    int my_argc = 3;
-    wchar_t* my_argv[3];
-    int offset = 1; // skip the opening quote.
-    my_argv[0] = &cmdline[offset];
-    do {  // scan for for the closing quote.
-        offset++;
-    } while(cmdline[offset] != L'\"');
-    cmdline[offset] = L'\0';
-    offset += 2; // skip quote that we turned into NUL and the space after it.
-    my_argv[1] = &cmdline[offset];
-    do {
-        offset++;
-    } while (cmdline[offset] != L' ');
-    cmdline[offset] = L'\0';
-    offset++; // skip space that we turned into NUL.
-    my_argv[2] = &cmdline[offset];
+    int my_argc = 0;
+    wchar_t** my_argv = CommandLineToArgvW(GetCommandLine(), &my_argc);
     // End atrocity.
 
     realmain(my_argc, my_argv);
 
-exit:
-    printf("svc_main exiting\n");
+    DEVTRACE("svc_main exiting\n");
     fflush(stdout);
 
     sm_svc_status.dwCurrentState = SERVICE_STOPPED;
