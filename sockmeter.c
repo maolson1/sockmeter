@@ -24,6 +24,10 @@ TODO:
     SIO_QUERY_RSS_PROCESSOR_INFO rather than round-robin.
 -cmdline args to force v4/6 when using hostnames
 -allow a single service instance to listen on multiple ports
+
+REFERENCE:
+-service reg path: hklm\system\currentcontrolset\services\sockmeter
+-service log (only written by debug build): c:\sockmeter-svc-log.txt
 */
 
 #define WIN32_LEAN_AND_MEAN 1
@@ -1029,13 +1033,6 @@ DWORD sm_service_fn(void* param)
 
     thread = sm_threads;
     while (TRUE) {
-
-        // TODO: how to break out of accept when service stops?
-        // For now, just break out the next time we return from accept.
-        if (sm_cleanup_time) {
-            goto exit;
-        }
-
         SM_CONN* conn = sm_accept_conn(ls, thread);
         if (conn == NULL) {
             goto exit;
@@ -1047,6 +1044,7 @@ DWORD sm_service_fn(void* param)
     }
 
 exit:
+    // TODO: join all threads before exit
     if (ls != INVALID_SOCKET) {
         closesocket(ls);
     }
@@ -1544,12 +1542,46 @@ void WINAPI svc_main(DWORD argc, wchar_t** argv)
     SetServiceStatus(sm_svc_status_handle, &sm_svc_status);
 
     #ifdef _DEBUG
-    FILE* f;
-    freopen_s(&f, "C:\\sockmeter-svc-log.txt", "w", stdout);
+        FILE* f;
+        freopen_s(&f, "C:\\sockmeter-svc-log.txt", "w", stdout);
     #endif
 
-    realmain(argc, argv);
+    // Begin atrocity: if the service starts by virtue of our StartService
+    // call, then the argc/argv passed to svc_main are the same as those
+    // passed to wmain. But if we start at boot by virtue of being an
+    // auto-start service (or by starting the service with "net start sockmeter"
+    // then the ImagePath args from the registry are passed to wmain but
+    // just a single arg with the name of the service ("sockmeter") is
+    // passed to svc_main. So, look up the command line with GetCommandLine
+    // and use that to populate our own argc/argv to pass to realmain.
+    UNREFERENCED_PARAMETER(argc);
+    UNREFERENCED_PARAMETER(argv);
+    wchar_t* cmdline = GetCommandLine();
+    if (cmdline == NULL) {
+        DEVTRACE("GetCommandLine failed\n");
+        goto exit;
+    }
+    int my_argc = 3;
+    wchar_t* my_argv[3];
+    int offset = 1; // skip the opening quote.
+    my_argv[0] = &cmdline[offset];
+    do {  // scan for for the closing quote.
+        offset++;
+    } while(cmdline[offset] != L'\"');
+    cmdline[offset] = L'\0';
+    offset += 2; // skip quote that we turned into NUL and the space after it.
+    my_argv[1] = &cmdline[offset];
+    do {
+        offset++;
+    } while (cmdline[offset] != L' ');
+    cmdline[offset] = L'\0';
+    offset++; // skip space that we turned into NUL.
+    my_argv[2] = &cmdline[offset];
+    // End atrocity.
 
+    realmain(my_argc, my_argv);
+
+exit:
     printf("svc_main exiting\n");
     fflush(stdout);
 
