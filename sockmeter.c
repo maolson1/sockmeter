@@ -40,6 +40,7 @@ REFERENCE:
 #include <mstcpip.h>
 #include <iphlpapi.h>
 #include <shellapi.h>
+#include "stats.h"
 
 #define VERSION "3.0.0"
 
@@ -203,14 +204,6 @@ inline ULONG64 sm_curtime_us(void)
         return 0;
     }
     return ticks * 1000000 / sm_perf_freq;
-}
-
-inline void sm_mean(ULONG64* to, ULONG64* to_n, ULONG64 from, ULONG64 from_n)
-{
-    // Merge two means.
-    // "to" is a mean of "to_n" values; "from" is a mean of "from_n" values.
-    *to = (*to * *to_n + from * from_n) / (*to_n + from_n);
-    *to_n += from_n;
 }
 
 SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
