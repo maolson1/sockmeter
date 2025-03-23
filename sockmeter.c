@@ -673,60 +673,36 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             DEVTRACE("conn disconnected\n");
             sm_del_conn(thread, conn);
 
-        } else if (!svcmode && conn->in_resp && io->dir == SmDirectionRecv) {
-
-            // Response received.
-            DEVTRACE("recv resp complete\n");
-
-            ULONG64 reqlatency = sm_curtime_us() - conn->req_start_us;
-            sm_mean(&thread->reqlatency, &thread->numreqs, reqlatency, 1);
-
-            thread->xferred_tx += conn->xferred_tx;
-            thread->xferred_rx += conn->xferred_rx;
-            conn->xferred_tx = 0;
-            conn->xferred_rx = 0;
-
-            // Shut down or do the next req.
-
-            if (sm_cleanup_time || sm_durationms == 0) {
-                DEVTRACE("shutting down conn\n");
-                shutdown(conn->sock, SD_BOTH);
-                sm_del_conn(thread, conn);
-            } else {
-                io->xferred = 0;
-                conn->in_req = FALSE;
-                conn->in_resp = FALSE;
-                if (svcmode) {
-                    err = sm_recv_req(conn);
-                    if (err != NO_ERROR) {
-                        goto exit;
-                    }
-                } else {
-                    err = sm_issue_req(conn);
-                    if (err != NO_ERROR) {
-                        goto exit;
-                    }
-                }
-            }
-
-        } else if (svcmode && conn->in_resp && io->dir == SmDirectionSend) {
+        } else if (conn->in_resp) {
 
             // Response sent.
-            DEVTRACE("send resp complete\n");
+
+            conn->in_req = FALSE;
+            conn->in_resp = FALSE;
+
+            if (svcmode) {
+                DEVTRACE("send response complete\n");
+            } else {
+                DEVTRACE("recv response complete\n");
+
+                // Record stats for this request.
+                ULONG64 reqlatency = sm_curtime_us() - conn->req_start_us;
+                sm_mean(&thread->reqlatency, &thread->numreqs, reqlatency, 1);
+                thread->xferred_tx += conn->xferred_tx;
+                thread->xferred_rx += conn->xferred_rx;
+            }
 
             conn->xferred_tx = 0;
             conn->xferred_rx = 0;
 
-            // Shut down or do the next req.
+            // Shut down or do the next request.
 
-            if (sm_cleanup_time) {
+            if (sm_cleanup_time || (!svcmode && sm_durationms == 0)) {
                 DEVTRACE("shutting down conn\n");
                 shutdown(conn->sock, SD_BOTH);
                 sm_del_conn(thread, conn);
             } else {
                 io->xferred = 0;
-                conn->in_req = FALSE;
-                conn->in_resp = FALSE;
                 if (svcmode) {
                     err = sm_recv_req(conn);
                     if (err != NO_ERROR) {
@@ -742,7 +718,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 
         } else if (!svcmode && !conn->in_req && io->dir == SmDirectionSend) {
 
-            // Req sent.
+            // Request sent.
             DEVTRACE("send req complete\n");
             conn->in_req = TRUE;
 
@@ -759,7 +735,7 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
 
         } else if (svcmode && !conn->in_req && io->dir == SmDirectionRecv) {
 
-            // Req received.
+            // Request received.
             conn->in_req = TRUE;
 
             if (xferred != sizeof(SM_REQ)) {
@@ -1227,8 +1203,8 @@ void sm_client(void)
         "threads: %d\n"
         "sockets: %d\n"
         "runtime_ms: %llu\n"
-        "req_bytes: %llu\n"
         "io_bytes: %d\n"
+        "req_bytes: %llu\n"
         "req_count: %llu\n"
         "req_avg_us: %llu\n"
         "tx_bytes: %llu\n"
@@ -1239,8 +1215,8 @@ void sm_client(void)
         sm_nthread,
         sm_nsock,
         t_elapsed_us / 1000,
-        sm_reqsize,
         sm_iosize,
+        sm_reqsize,
         numreqs,
         reqlatency,
         xferred_tx,
