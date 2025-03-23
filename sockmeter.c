@@ -41,7 +41,7 @@ REFERENCE:
 #include <mstcpip.h>
 #include <iphlpapi.h>
 
-#define VERSION "2.0.0"
+#define VERSION "2.0.1"
 
 #define USAGE \
 "\nsockmeter version " VERSION "\n" \
