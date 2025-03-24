@@ -1,73 +1,83 @@
 #pragma once
 
-// Logarithmic histogram that records the mean
-// in each bucket to reduce error.
-
-#define SM_HISTO_NUM_BUCKETS 64
-
-typedef struct {
-	ULONG64 count;
-	ULONG64 mean;
-} SmHistoBucket;
-
-typedef struct {
-	SmHistoBucket buckets[SM_HISTO_NUM_BUCKETS];
-} SmHisto;
-
-
 // Merge two means, recording the output into "to" and "to_n".
 // "to" is a mean of "to_n" values; "from" is a mean of "from_n" values.
 inline void sm_mean(ULONG64* to, ULONG64* to_n, ULONG64 from, ULONG64 from_n)
 {
-	*to = (*to * *to_n + from * from_n) / (*to_n + from_n);
-	*to_n += from_n;
+    *to = (*to * *to_n + from * from_n) / (*to_n + from_n);
+    *to_n += from_n;
 }
 
-inline SmHisto* sm_new_histo(void)
+// A histogram for estimating percentiles of data without storing
+// all of the values. This implementation uses uniformly-sized buckets.
+// If a new value is sampled that cannot be encoded by the histogram
+// (the max encodable value is num_buckets * bucket_size),
+// the bucket size is repeatedly doubled (and existing counts
+// reshuffled) until the new value is encodable.
+
+// This gives percentile estimates accurate to within a few percent
+// (except at low percentiles- see stats_test) with Weibull-distributed
+// data, and hopefully with data of any distribution sockmeter uses it
+// for.
+
+#define SM_HISTO_NUM_BUCKETS 100
+
+typedef struct {
+    ULONG64 count;
+    ULONG64 mean;
+    ULONG64 bucket_width;
+    ULONG64 buckets[SM_HISTO_NUM_BUCKETS];
+} SmStat;
+
+inline SmStat* sm_new_stat(void)
 {
-	SmHisto* h = malloc(sizeof(SmHisto));
-	if (h == NULL) {
-		return NULL;
-	}
-	RtlZeroMemory(h, sizeof(*h));
-	return h;
+    SmStat* s = malloc(sizeof(SmStat));
+    if (s == NULL) {
+        return NULL;
+    }
+    RtlZeroMemory(s, sizeof(*s));
+    s->bucket_width = 1;
+    return s;
 }
 
-inline void sm_del_histo(SmHisto* h)
+inline void sm_del_stat(SmStat* s)
 {
-	free(h);
+    free(s);
 }
 
-inline void sm_histo_add(SmHisto* h, ULONG64 val)
+inline void sm_stat_grow(SmStat* s)
 {
-	ULONG val_log2;
-	_BitScanReverse64(&val_log2, val);
-	// printf("val = %llu, val_log2 = %lu\n", val, val_log2);
+    s->bucket_width *= 2;
 
-	SmHistoBucket* bucket = &h->buckets[val_log2];
-	sm_mean(&bucket->mean, &bucket->count, val, 1);
+    // Reshuffle the buckets- quite easy when we are doubling the bucket
+    // width, since each resulting bucket on the left half of the
+    // new histogram layout owns precisely the counts from two buckets
+    // of the old layout.
+
+    for (int i = 0; i < SM_HISTO_NUM_BUCKETS / 2; i++) {
+        s->buckets[i] = s->buckets[2 * i] + s->buckets[2 * i + 1];
+    }
+    for (int i = SM_HISTO_NUM_BUCKETS / 2; i < SM_HISTO_NUM_BUCKETS; i++) {
+        s->buckets[i] = 0;
+    }
 }
 
-inline ULONG64 sm_histo_percentile(SmHisto* h, ULONG p)
+inline void sm_stat_add(SmStat* s, ULONG64 val)
 {
-	// p is in units of percent, which means we can return an
-	// estimate for the 99th percentile at best.
-	// This library is optimized for speed rather than
-	// asymptotic accuracy, so don't make any false promises
-	// by returning potentially-bogus estimates of the
-	// 99.99999999th percentile.
+    sm_mean(&s->mean, &s->count, val, 1);
+    while (val >= s->bucket_width * SM_HISTO_NUM_BUCKETS) {
+        sm_stat_grow(s);
+    }
+    s->buckets[val / s->bucket_width]++;
+}
 
-	ULONG64 total = 0;
-	for (ULONG i = 0; i < SM_HISTO_NUM_BUCKETS; i++) {
-		total += h->buckets[i].count;
-	}
-
-	ULONG bucket_i = 0;
-	ULONG64 p_count = total * p / 100; // # of vals less than p'th percentile.
-	while (p_count > h->buckets[bucket_i].count) {
-		p_count -= h->buckets[bucket_i].count;
-		bucket_i++;
-	}
-
-	return h->buckets[bucket_i].mean;
+inline ULONG64 sm_stat_percentile(SmStat* s, ULONG p)
+{
+    ULONG64 p_count = s->count * p / 100; // # of vals less than p'th percentile.
+    ULONG bucket_i = 0;
+    while (p_count > s->buckets[bucket_i]) {
+        p_count -= s->buckets[bucket_i];
+        bucket_i++;
+    }
+    return s->bucket_width * bucket_i + s->bucket_width / 2;
 }
