@@ -22,24 +22,29 @@ int __cdecl wmain(int argc, wchar_t** argv)
 
     printf("Testing histogram.\n");
 
-    SmStat* s = sm_new_stat();
+    SmStat* s = malloc(sizeof(SmStat));
     if (s == NULL) {
         printf("Failed to create new SmStat\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
+    sm_stat_init(s);
+
     for (int i = 0; i < RTL_NUMBER_OF(test_data); i++) {
         sm_stat_add(s, test_data[i]);
     }
+
     for (int i = 0; i < RTL_NUMBER_OF(percentiles); i++) {
         ULONG64 estimate = sm_stat_percentile(s, tested_percentiles[i]);
         printf("p%d=%llu, estimate=%llu, error=%llu%%\n",
             tested_percentiles[i], percentiles[i], estimate,
             percent_error(percentiles[i], estimate));
     }
-    sm_del_stat(s);
 
 exit:
+    if (s != NULL) {
+        free(s);
+    }
     return err;
 }
 

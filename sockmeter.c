@@ -10,13 +10,10 @@ the service uses a single port number.
 TODO:
 -add metric: avg packet size
 -add metric: cpu%
--add metric: req latency
 -write stats to json
 -iofrag option (pass multiple wsabufs to WSASend/WSARecv)
 -reuseconn option (default true; whether to reuse conns for new reqs)
--service sends back info (cpu% etc)
 -consider SO_LINGER/SO_DONTLINGER
--pingpong
 -Currently the service side thread count is min(64, numProc).
     Consider creating a number of threads equal to the number of
     RSS processors and assigning conns to threads based on the output of
@@ -40,7 +37,6 @@ REFERENCE:
 #include <mstcpip.h>
 #include <iphlpapi.h>
 #include <shellapi.h>
-#include "stats.h"
 
 #define VERSION "3.0.0"
 
@@ -90,6 +86,8 @@ REFERENCE:
 #else
     #define DEVTRACE(...)
 #endif
+
+#include "stats.h"
 
 typedef enum {
     SmDirectionSend,
@@ -156,8 +154,8 @@ typedef struct _SM_THREAD {
     ULONG64 xferred_rx; // sum of bytes rx'd by completed reqs.
     SM_CONN* conns;
     ULONG numconns;
-    ULONG64 reqlatency;
     ULONG64 numreqs;
+    SmStat reqlatency;
 } SM_THREAD;
 
 // Variables for both client and service:
@@ -431,6 +429,7 @@ SM_THREAD* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
     InitializeCriticalSection(&thread->lock);
     thread->numconns = 0;
     thread->conns = NULL;
+    sm_stat_init(&thread->reqlatency);
 
     thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
     if (thread->t == NULL) {
@@ -675,8 +674,8 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
                 DEVTRACE("recv response complete\n");
 
                 // Record stats for this request.
-                ULONG64 reqlatency = sm_curtime_us() - conn->req_start_us;
-                sm_mean(&thread->reqlatency, &thread->numreqs, reqlatency, 1);
+                ULONG64 latency = sm_curtime_us() - conn->req_start_us;
+                sm_stat_add(&thread->reqlatency, latency);
                 thread->xferred_tx += conn->xferred_tx;
                 thread->xferred_rx += conn->xferred_rx;
             }
@@ -1194,8 +1193,14 @@ void sm_client(void)
 
     ULONG64 xferred_tx = 0;
     ULONG64 xferred_rx = 0;
-    ULONG64 reqlatency = 0;
-    ULONG64 numreqs = 0;
+    SmStat* reqlatency = malloc(sizeof(SmStat));
+    if (reqlatency == NULL) {
+        printf("Failed to allocate memory for calculating stats!\n");
+        return;
+    }
+    sm_stat_init(reqlatency);
+
+    // Merge the per-thread stats.
     thread = sm_threads;
     while (thread != NULL) {
         if (thread->conns != NULL) {
@@ -1203,9 +1208,10 @@ void sm_client(void)
         }
         xferred_tx += thread->xferred_tx;
         xferred_rx += thread->xferred_rx;
-        sm_mean(&reqlatency, &numreqs, thread->reqlatency, thread->numreqs);
+        sm_stat_merge(reqlatency, &thread->reqlatency);
         thread = thread->next;
     }
+
     printf(
         "\ncpus: %d\n"
         "threads: %d\n"
@@ -1214,7 +1220,9 @@ void sm_client(void)
         "io_bytes: %d\n"
         "req_bytes: %llu\n"
         "req_count: %llu\n"
-        "req_avg_us: %llu\n"
+        "reqlatency_avg_us: %llu\n"
+        "reqlatency_p99_us: %llu\n"
+        "reqlatency_max_us: %llu\n"
         "tx_bytes: %llu\n"
         "tx_Mbps: %llu\n"
         "rx_bytes: %llu\n"
@@ -1225,12 +1233,16 @@ void sm_client(void)
         t_elapsed_us / 1000,
         sm_iosize,
         sm_reqsize,
-        numreqs,
-        reqlatency,
+        reqlatency->count,
+        reqlatency->mean,
+        sm_stat_percentile(reqlatency, 99),
+        reqlatency->max,
         xferred_tx,
         (xferred_tx * 8) / (t_elapsed_us),
         xferred_rx,
         (xferred_rx * 8) / (t_elapsed_us));
+
+    free(reqlatency);
 }
 
 int realmain(int argc, wchar_t** argv)
