@@ -99,7 +99,7 @@ typedef enum {
 typedef struct {
     SmDirection dir;
     ULONG64 to_xfer;
-} SmReq;
+} SmRequest;
 typedef struct {
 #define RESP_UNUSED_VALUE 13
     ULONG64 unused;
@@ -166,8 +166,6 @@ int sm_sbuf = -1;
 int sm_rbuf = -1;
 BOOLEAN svcmode = FALSE;
 int sm_ncpu = 0;
-GUID acceptex_guid = WSAID_ACCEPTEX;
-LPFN_ACCEPTEX AcceptExFn;
 
 // Variables for client only:
 SmPeer* sm_peers = NULL;
@@ -182,6 +180,8 @@ SERVICE_STATUS sm_svc_status;
 SOCKADDR_INET sm_svcaddr = {0};
 size_t sm_svcaddrlen = 0;
 HANDLE sm_accept_iocp = NULL;
+GUID acceptex_guid = WSAID_ACCEPTEX;
+LPFN_ACCEPTEX AcceptExFn;
 #define SM_ACCEPT_KEY_CLEANUP_TIME 1
 #define SM_SERVICE_NAME L"sockmeter"
 
@@ -457,7 +457,7 @@ exit:
     return thread;
 }
 
-void sm_del_thread(SmIoThread* thread)
+void sm_del_io_thread(SmIoThread* thread)
 {
     // This is called from the main thread on termination, and we assume
     // the SmIoThread's thread is already terminated.
@@ -537,7 +537,7 @@ int sm_issue_req(SmConn* conn)
 
     DEVTRACE("issue req\n");
 
-    SmReq* req = (SmReq*)conn->io_tx->buf;
+    SmRequest* req = (SmRequest*)conn->io_tx->buf;
     switch (conn->dir) {
     case SmDirectionSend:
         req->dir = SmDirectionRecv;
@@ -555,8 +555,8 @@ int sm_issue_req(SmConn* conn)
 
     conn->req_start_us = sm_curtime_us();
 
-    conn->io_tx->to_xfer = sizeof(SmReq);
-    err = sm_send(conn, 0, sizeof(SmReq));
+    conn->io_tx->to_xfer = sizeof(SmRequest);
+    err = sm_send(conn, 0, sizeof(SmRequest));
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -582,8 +582,8 @@ int sm_recv_req(SmConn* conn)
 
     DEVTRACE("issue recv for req\n");
 
-    conn->io_rx->to_xfer = sizeof(SmReq);
-    err = sm_recv(conn, 0, sizeof(SmReq), MSG_WAITALL);
+    conn->io_rx->to_xfer = sizeof(SmRequest);
+    err = sm_recv(conn, 0, sizeof(SmRequest), MSG_WAITALL);
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -730,12 +730,12 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
             // Request received.
             conn->state = SmConnStatePayload;
 
-            if (xferred != sizeof(SmReq)) {
-                printf("Expected sizeof(SmReq) bytes but got %d\n", xferred);
+            if (xferred != sizeof(SmRequest)) {
+                printf("Expected sizeof(SmRequest) bytes but got %d\n", xferred);
                 err = 1;
                 goto exit;
             }
-            SmReq* req = (SmReq*)conn->io_rx->buf;
+            SmRequest* req = (SmRequest*)conn->io_rx->buf;
             conn->to_xfer = req->to_xfer;
             conn->dir = req->dir;
             DEVTRACE("recv req complete, to_xfer=%llu, dir=%d\n",
@@ -1014,7 +1014,7 @@ DWORD sm_service_io_fn(void* param)
     return 0;
 }
 
-DWORD sm_service_fn(void* param)
+DWORD sm_service(void* param)
 {
     UNREFERENCED_PARAMETER(param);
     int err = NO_ERROR;
@@ -1222,7 +1222,7 @@ void sm_client(void)
         "req_count: %llu\n"
         "reqlatency_avg_us: %llu\n"
         "reqlatency_p99_us: %llu\n"
-        "reqlatency_max_us: %llu\n"
+        "reqlatency_p100_us: %llu\n"
         "tx_bytes: %llu\n"
         "tx_Mbps: %llu\n"
         "rx_bytes: %llu\n"
@@ -1377,8 +1377,8 @@ int realmain(int argc, wchar_t** argv)
         goto exit;
     }
 
-    if (sm_iosize < sizeof(SmReq)) {
-        printf("iosize must be at least %lu\n", (int)sizeof(SmReq));
+    if (sm_iosize < sizeof(SmRequest)) {
+        printf("iosize must be at least %lu\n", (int)sizeof(SmRequest));
         err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
@@ -1387,7 +1387,7 @@ int realmain(int argc, wchar_t** argv)
         if (!nthread_passed) {
             sm_nthread = min(sm_ncpu, 64);
         }
-        sm_service_fn(NULL);
+        sm_service(NULL);
     } else {
         if (numpeers == 0) {
             printf("ERROR: Must pass (-tx or -rx or -txrx) at least once\n");
@@ -1405,7 +1405,7 @@ int realmain(int argc, wchar_t** argv)
 
 exit:
     while (sm_threads != NULL) {
-        sm_del_thread(sm_threads);
+        sm_del_io_thread(sm_threads);
     }
 
     while (sm_peers != NULL) {
