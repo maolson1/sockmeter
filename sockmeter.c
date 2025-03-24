@@ -93,73 +93,73 @@ typedef enum {
     SmDirectionSend,
     SmDirectionRecv,
     SmDirectionBoth,
-} SM_DIRECTION;
+} SmDirection;
 
 #pragma pack(push,1)
 typedef struct {
-    SM_DIRECTION dir;
+    SmDirection dir;
     ULONG64 to_xfer;
-} SM_REQ;
+} SmReq;
 typedef struct {
 #define RESP_UNUSED_VALUE 13
     ULONG64 unused;
-} SM_RESPONSE;
+} SmResponse;
 #pragma pack(pop)
 
-typedef struct _SM_PEER {
-    struct _SM_PEER* next;
+typedef struct _SmPeer {
+    struct _SmPeer* next;
     SOCKADDR_INET addr;
     int addrlen;
-    SM_DIRECTION dir;
-} SM_PEER;
+    SmDirection dir;
+} SmPeer;
 
-typedef struct _SM_IO {
+typedef struct _SmIo {
     WSAOVERLAPPED ov; // Assumed to be the first field.
     WSABUF wsabuf;
     DWORD recvflags;
-    SM_DIRECTION dir;
+    SmDirection dir;
     DWORD xferred;
     DWORD to_xfer; // Usually equal to bufsize.
     char* buf;
     int bufsize;
-} SM_IO;
+} SmIo;
 
 typedef enum {
     SmConnStateRequest,
     SmConnStatePayload,
     SmConnStateResponse
-} SM_CONN_STATE;
+} SmConnState;
 
-typedef struct _SM_CONN {
-    struct _SM_CONN* next;
+typedef struct _SmConn {
+    struct _SmConn* next;
     SOCKET sock;
-    SM_CONN_STATE state;
-    SM_DIRECTION dir;
-    SM_IO* io_tx;
-    SM_IO* io_rx;
+    SmConnState state;
+    SmDirection dir;
+    SmIo* io_tx;
+    SmIo* io_rx;
 
     // Values pertaining to current request's payload.
     ULONG64 xferred_tx;
     ULONG64 xferred_rx;
     ULONG64 to_xfer;
     ULONG64 req_start_us;
-} SM_CONN;
+} SmConn;
 
-typedef struct _SM_THREAD {
-    struct _SM_THREAD* next;
+typedef struct _SmIoThread {
+    struct _SmIoThread* next;
     HANDLE t;
     HANDLE iocp;
     CRITICAL_SECTION lock;
     ULONG64 xferred_tx; // sum of bytes tx'd by completed reqs.
     ULONG64 xferred_rx; // sum of bytes rx'd by completed reqs.
-    SM_CONN* conns;
+    SmConn* conns;
     ULONG numconns;
     ULONG64 numreqs;
     SmStat reqlatency;
-} SM_THREAD;
+} SmIoThread;
 
 // Variables for both client and service:
-SM_THREAD* sm_threads = NULL;
+SmIoThread* sm_threads = NULL;
 int sm_nthread = 1;
 int sm_iosize = 65535;  // 64KB default
 int sm_sbuf = -1;
@@ -170,7 +170,7 @@ GUID acceptex_guid = WSAID_ACCEPTEX;
 LPFN_ACCEPTEX AcceptExFn;
 
 // Variables for client only:
-SM_PEER* sm_peers = NULL;
+SmPeer* sm_peers = NULL;
 ULONG64 sm_reqsize = 16000000;  // 16MB default
 int sm_nsock = 1;
 int sm_durationms = 0;
@@ -204,16 +204,16 @@ inline ULONG64 sm_curtime_us(void)
     return ticks * 1000000 / sm_perf_freq;
 }
 
-SM_PEER* sm_new_peer(wchar_t* host, wchar_t* port, SM_DIRECTION dir)
+SmPeer* sm_new_peer(wchar_t* host, wchar_t* port, SmDirection dir)
 {
     int err = NO_ERROR;
-    SM_PEER* peer = NULL;
+    SmPeer* peer = NULL;
     ADDRINFOW hints = {0};
     ADDRINFOW* res = NULL;
 
-    peer = malloc(sizeof(SM_PEER));
+    peer = malloc(sizeof(SmPeer));
     if (peer == NULL) {
-        printf("Failed to allocate SM_PEER\n");
+        printf("Failed to allocate SmPeer\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
@@ -255,9 +255,9 @@ exit:
     return peer;
 }
 
-void sm_del_peer(SM_PEER* peer)
+void sm_del_peer(SmPeer* peer)
 {
-    SM_PEER** p = &sm_peers;
+    SmPeer** p = &sm_peers;
     while (*p != peer) {
         p = &((*p)->next);
     }
@@ -266,14 +266,14 @@ void sm_del_peer(SM_PEER* peer)
     free(peer);
 }
 
-SM_IO* sm_new_io(SM_DIRECTION dir)
+SmIo* sm_new_io(SmDirection dir)
 {
     int err = NO_ERROR;
-    SM_IO* io = NULL;
+    SmIo* io = NULL;
 
-    io = malloc(sizeof(SM_IO));
+    io = malloc(sizeof(SmIo));
     if (io == NULL) {
-        printf("Failed to allocate SM_IO\n");
+        printf("Failed to allocate SmIo\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
@@ -312,7 +312,7 @@ exit:
     return io;
 }
 
-void sm_del_io(SM_IO* io)
+void sm_del_io(SmIo* io)
 {
     // TODO: Check HasOverlappedIoCompleted and cancel/wait for completion
     // if necessary.
@@ -321,14 +321,14 @@ void sm_del_io(SM_IO* io)
     free(io);
 }
 
-SM_CONN* sm_new_conn(SM_THREAD* thread, SOCKET sock, SM_DIRECTION dir)
+SmConn* sm_new_conn(SmIoThread* thread, SOCKET sock, SmDirection dir)
 {
     int err = NO_ERROR;
-    SM_CONN* conn = NULL;
+    SmConn* conn = NULL;
 
-    conn = malloc(sizeof(SM_CONN));
+    conn = malloc(sizeof(SmConn));
     if (conn == NULL) {
-        printf("Failed to allocate SM_CONN\n");
+        printf("Failed to allocate SmConn\n");
         err = ERROR_NOT_ENOUGH_MEMORY;
         goto exit;
     }
@@ -383,10 +383,10 @@ exit:
     return conn;
 }
 
-void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
+void sm_del_conn(SmIoThread* thread, SmConn* conn)
 {
     EnterCriticalSection(&thread->lock);
-    SM_CONN** c = &(thread->conns);
+    SmConn** c = &(thread->conns);
     while (*c != conn) {
         c = &((*c)->next);
     }
@@ -407,14 +407,14 @@ void sm_del_conn(SM_THREAD* thread, SM_CONN* conn)
     free(conn);
 }
 
-SM_THREAD* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
+SmIoThread* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
 {
     int err = NO_ERROR;
-    SM_THREAD* thread = NULL;
+    SmIoThread* thread = NULL;
 
-    thread = malloc(sizeof(SM_THREAD));
+    thread = malloc(sizeof(SmIoThread));
     if (thread == NULL) {
-        printf("Failed to allocate SM_THREAD\n");
+        printf("Failed to allocate SmIoThread\n");
         return NULL;
     }
     memset(thread, 0, sizeof(*thread));
@@ -457,12 +457,12 @@ exit:
     return thread;
 }
 
-void sm_del_thread(SM_THREAD* thread)
+void sm_del_thread(SmIoThread* thread)
 {
     // This is called from the main thread on termination, and we assume
-    // the SM_THREAD's thread is already terminated.
+    // the SmIoThread's thread is already terminated.
 
-    SM_THREAD** t = &sm_threads;
+    SmIoThread** t = &sm_threads;
     while (*t != thread) {
         t = &((*t)->next);
     }
@@ -479,7 +479,7 @@ void sm_del_thread(SM_THREAD* thread)
     free(thread);
 }
 
-int sm_send(SM_CONN* conn, int offset, int numbytes)
+int sm_send(SmConn* conn, int offset, int numbytes)
 {
     int err = NO_ERROR;
 
@@ -504,7 +504,7 @@ exit:
     return err;
 }
 
-int sm_recv(SM_CONN* conn, int offset, int numbytes, int recvflags)
+int sm_recv(SmConn* conn, int offset, int numbytes, int recvflags)
 {
     int err = NO_ERROR;
 
@@ -531,13 +531,13 @@ exit:
     return err;
 }
 
-int sm_issue_req(SM_CONN* conn)
+int sm_issue_req(SmConn* conn)
 {
     int err = NO_ERROR;
 
     DEVTRACE("issue req\n");
 
-    SM_REQ* req = (SM_REQ*)conn->io_tx->buf;
+    SmReq* req = (SmReq*)conn->io_tx->buf;
     switch (conn->dir) {
     case SmDirectionSend:
         req->dir = SmDirectionRecv;
@@ -555,8 +555,8 @@ int sm_issue_req(SM_CONN* conn)
 
     conn->req_start_us = sm_curtime_us();
 
-    conn->io_tx->to_xfer = sizeof(SM_REQ);
-    err = sm_send(conn, 0, sizeof(SM_REQ));
+    conn->io_tx->to_xfer = sizeof(SmReq);
+    err = sm_send(conn, 0, sizeof(SmReq));
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -576,14 +576,14 @@ exit:
     return err;
 }
 
-int sm_recv_req(SM_CONN* conn)
+int sm_recv_req(SmConn* conn)
 {
     int err = NO_ERROR;
 
     DEVTRACE("issue recv for req\n");
 
-    conn->io_rx->to_xfer = sizeof(SM_REQ);
-    err = sm_recv(conn, 0, sizeof(SM_REQ), MSG_WAITALL);
+    conn->io_rx->to_xfer = sizeof(SmReq);
+    err = sm_recv(conn, 0, sizeof(SmReq), MSG_WAITALL);
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -592,17 +592,17 @@ exit:
     return err;
 }
 
-int sm_issue_resp(SM_CONN* conn)
+int sm_issue_resp(SmConn* conn)
 {
     int err = NO_ERROR;
 
     DEVTRACE("issue response\n");
 
-    SM_RESPONSE* resp = (SM_RESPONSE*)conn->io_tx->buf;
+    SmResponse* resp = (SmResponse*)conn->io_tx->buf;
     resp->unused = RESP_UNUSED_VALUE;
 
-    conn->io_tx->to_xfer = sizeof(SM_RESPONSE);
-    err = sm_send(conn, 0, sizeof(SM_RESPONSE));
+    conn->io_tx->to_xfer = sizeof(SmResponse);
+    err = sm_send(conn, 0, sizeof(SmResponse));
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -611,14 +611,14 @@ exit:
     return err;
 }
 
-int sm_recv_resp(SM_CONN* conn)
+int sm_recv_resp(SmConn* conn)
 {
     int err = NO_ERROR;
 
     DEVTRACE("issue recv for response\n");
 
-    conn->io_rx->to_xfer = sizeof(SM_RESPONSE);
-    err = sm_recv(conn, 0, sizeof(SM_RESPONSE), MSG_WAITALL);
+    conn->io_rx->to_xfer = sizeof(SmResponse);
+    err = sm_recv(conn, 0, sizeof(SmResponse), MSG_WAITALL);
     if (err != NO_ERROR) {
         goto exit;
     }
@@ -627,15 +627,15 @@ exit:
     return err;
 }
 
-int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
+int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
 {
     // Loop on GetQueuedCompletionStatus, reposting IOs or shutting down
     // conns as appropriate.
 
     int err = NO_ERROR;
     int xferred = 0;
-    SM_CONN* conn = NULL;
-    SM_IO* io = NULL;
+    SmConn* conn = NULL;
+    SmIo* io = NULL;
 
     while (TRUE) {
 
@@ -730,12 +730,12 @@ int sm_io_loop(SM_THREAD* thread, ULONG timeout_ms)
             // Request received.
             conn->state = SmConnStatePayload;
 
-            if (xferred != sizeof(SM_REQ)) {
-                printf("Expected sizeof(SM_REQ) bytes but got %d\n", xferred);
+            if (xferred != sizeof(SmReq)) {
+                printf("Expected sizeof(SmReq) bytes but got %d\n", xferred);
                 err = 1;
                 goto exit;
             }
-            SM_REQ* req = (SM_REQ*)conn->io_rx->buf;
+            SmReq* req = (SmReq*)conn->io_rx->buf;
             conn->to_xfer = req->to_xfer;
             conn->dir = req->dir;
             DEVTRACE("recv req complete, to_xfer=%llu, dir=%d\n",
@@ -846,11 +846,11 @@ exit:
     return err;
 }
 
-int sm_connect_conn(SM_THREAD* thread, SM_PEER* peer)
+int sm_connect_conn(SmIoThread* thread, SmPeer* peer)
 {
     int err = NO_ERROR;
     SOCKET sock = INVALID_SOCKET;
-    SM_CONN* conn = NULL;
+    SmConn* conn = NULL;
 
     sock = WSASocket(
         AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -930,10 +930,10 @@ exit:
     return err;
 }
 
-SM_CONN* sm_accept_conn(SOCKET ls, SM_THREAD* thread)
+SmConn* sm_accept_conn(SOCKET ls, SmIoThread* thread)
 {
     int err = NO_ERROR;
-    SM_CONN* conn = NULL;
+    SmConn* conn = NULL;
 
     SOCKET ss = WSASocket(
         AF_INET6, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -1009,7 +1009,7 @@ exit:
 DWORD sm_service_io_fn(void* param)
 {
     while (TRUE) {
-        sm_io_loop((SM_THREAD*)param, INFINITE);
+        sm_io_loop((SmIoThread*)param, INFINITE);
     }
     return 0;
 }
@@ -1019,7 +1019,7 @@ DWORD sm_service_fn(void* param)
     UNREFERENCED_PARAMETER(param);
     int err = NO_ERROR;
     SOCKET ls = INVALID_SOCKET;
-    SM_THREAD* thread = NULL;
+    SmIoThread* thread = NULL;
 
     sm_accept_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (sm_accept_iocp == NULL) {
@@ -1113,7 +1113,7 @@ DWORD sm_service_fn(void* param)
 
     thread = sm_threads;
     while (TRUE) {
-        SM_CONN* conn = sm_accept_conn(ls, thread);
+        SmConn* conn = sm_accept_conn(ls, thread);
         if (conn == NULL) {
             goto exit;
         }
@@ -1136,14 +1136,14 @@ exit:
 
 DWORD sm_client_io_fn(void* param)
 {
-    return sm_io_loop((SM_THREAD*)param, 5000);
+    return sm_io_loop((SmIoThread*)param, 5000);
 }
 
 void sm_client(void)
 {
     int err = NO_ERROR;
-    SM_THREAD* thread = NULL;
-    SM_PEER* peer = NULL;
+    SmIoThread* thread = NULL;
+    SmPeer* peer = NULL;
 
     for (int i = 0; i < sm_nthread; i++) {
         thread = sm_new_io_thread(sm_client_io_fn);
@@ -1377,8 +1377,8 @@ int realmain(int argc, wchar_t** argv)
         goto exit;
     }
 
-    if (sm_iosize < sizeof(SM_REQ)) {
-        printf("iosize must be at least %lu\n", (int)sizeof(SM_REQ));
+    if (sm_iosize < sizeof(SmReq)) {
+        printf("iosize must be at least %lu\n", (int)sizeof(SmReq));
         err = ERROR_INVALID_PARAMETER;
         goto exit;
     }
