@@ -85,11 +85,11 @@ inline void sm_stat_merge(SmStat* to, SmStat* from)
 
 inline ULONG64 sm_stat_percentile(SmStat* s, ULONG p)
 {
-    // Number of values less than p'th percentile.
-    ULONG64 p_count = s->count * p / 100;
+    // Number of values less than or equal to p'th percentile.
+    ULONG64 p_count = (s->count * p / 100) + 1;
 
     ULONG bucket_i = 0;
-    while (p_count > s->buckets[bucket_i]) {
+    while (bucket_i < SM_HISTO_NUM_BUCKETS && p_count > s->buckets[bucket_i]) {
         p_count -= s->buckets[bucket_i];
         bucket_i++;
     }
