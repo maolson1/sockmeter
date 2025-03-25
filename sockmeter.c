@@ -1480,7 +1480,7 @@ int sm_start_svc(int argc, wchar_t** argv)
                 scm_handle, SM_SERVICE_NAME, SM_SERVICE_NAME,
                 SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
                 SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, cmdline,
-                NULL, NULL, NULL, NULL, NULL);
+                NULL, NULL, NULL, L"NT AUTHORITY\\LocalService", NULL);
             if (svc_handle == NULL) {
                 err = GetLastError();
                 printf("CreateService failed with %d\n", err);
