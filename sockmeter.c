@@ -286,13 +286,6 @@ SmIo* sm_new_io(SmDirection dir)
     }
     memset(io, 0, sizeof(*io));
 
-    io->ov.hEvent = WSACreateEvent();
-    if (io->ov.hEvent == WSA_INVALID_EVENT) {
-        err = WSAGetLastError();
-        printf("WSACreateEvent failed with %d\n", err);
-        goto exit;
-    }
-
     io->dir = dir;
     io->xferred = 0;
     io->bufsize = sm_iosize;
@@ -309,9 +302,6 @@ SmIo* sm_new_io(SmDirection dir)
 exit:
     if (err != NO_ERROR) {
         if (io != NULL) {
-            if (io->ov.hEvent != WSA_INVALID_EVENT) {
-                WSACloseEvent(io->ov.hEvent);
-            }
             free(io);
             io = NULL;
         }
@@ -323,7 +313,6 @@ void sm_del_io(SmIo* io)
 {
     // TODO: Check HasOverlappedIoCompleted and cancel/wait for completion
     // if necessary.
-    WSACloseEvent(io->ov.hEvent);
     free(io->buf);
     free(io);
 }
