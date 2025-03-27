@@ -21,6 +21,7 @@
 typedef struct {
     ULONG64 count;
     ULONG64 mean;
+    ULONG64 min;
     ULONG64 max;
     ULONG64 bucket_width;
     ULONG64 buckets[SM_HISTO_NUM_BUCKETS];
@@ -39,6 +40,7 @@ inline void sm_mean_merge(
 inline void sm_stat_init(SmStat* s)
 {
     RtlZeroMemory(s, sizeof(*s));
+    s->min = (ULONG64)-1;
     s->bucket_width = 1;
 }
 
@@ -64,6 +66,9 @@ inline void sm_stat_add(SmStat* s, ULONG64 val)
     if (s->max < val) {
         s->max = val;
     }
+    if (s->min > val) {
+        s->min = val;
+    }
     sm_mean_merge(&s->mean, &s->count, val, 1);
     while (val >= s->bucket_width * SM_HISTO_NUM_BUCKETS) {
         sm_stat_widen(s);
@@ -80,6 +85,7 @@ inline void sm_stat_merge(SmStat* to, SmStat* from)
         to->buckets[i] += from->buckets[i];
     }
     sm_mean_merge(&to->mean, &to->count, from->mean, from->count);
+    to->min = min(to->min, from->min);
     to->max = max(to->max, from->max);
 }
 

@@ -1220,9 +1220,10 @@ void sm_client(void)
         "io_bytes: %d\n"
         "req_bytes: %llu\n"
         "req_count: %llu\n"
+        "reqlatency_min_us: %llu\n"
         "reqlatency_avg_us: %llu\n"
         "reqlatency_p99_us: %llu\n"
-        "reqlatency_p100_us: %llu\n"
+        "reqlatency_max_us: %llu\n"
         "tx_bytes: %llu\n"
         "tx_Mbps: %llu\n"
         "rx_bytes: %llu\n"
@@ -1234,6 +1235,7 @@ void sm_client(void)
         sm_iosize,
         sm_reqsize,
         reqlatency->count,
+        reqlatency->min,
         reqlatency->mean,
         sm_stat_percentile(reqlatency, 99),
         reqlatency->max,
