@@ -74,6 +74,7 @@ REFERENCE:
 "   -iosize [#]: Bytes passed in each send/recv (default: 64KB).\n" \
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
+"   -histo reqlatency: Print a histogram of request latencies\n" \
 "\n" \
 "Example:\n" \
 "   sockmeter -svc 30000\n" \
@@ -158,6 +159,11 @@ typedef struct _SmIoThread {
     SmStat reqlatency;
 } SmIoThread;
 
+typedef enum {
+    SmStatsModeRegular,
+    SmStatsModeHistoReqLatency,
+} SmStatsMode;
+
 // Variables for both client and service:
 SmIoThread* sm_threads = NULL;
 int sm_nthread = 1;
@@ -173,6 +179,7 @@ ULONG64 sm_reqsize = 16000000;  // 16MB default
 int sm_nsock = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
+SmStatsMode sm_statsmode;
 
 // Variables for service only:
 SERVICE_STATUS_HANDLE sm_svc_status_handle;
@@ -1212,37 +1219,60 @@ void sm_client(void)
         thread = thread->next;
     }
 
-    printf(
-        "\ncpus: %d\n"
-        "threads: %d\n"
-        "sockets: %d\n"
-        "runtime_ms: %llu\n"
-        "io_bytes: %d\n"
-        "req_bytes: %llu\n"
-        "req_count: %llu\n"
-        "reqlatency_min_us: %llu\n"
-        "reqlatency_avg_us: %llu\n"
-        "reqlatency_p99_us: %llu\n"
-        "reqlatency_max_us: %llu\n"
-        "tx_bytes: %llu\n"
-        "tx_Mbps: %llu\n"
-        "rx_bytes: %llu\n"
-        "rx_Mbps: %llu\n",
-        sm_ncpu,
-        sm_nthread,
-        sm_nsock,
-        t_elapsed_us / 1000,
-        sm_iosize,
-        sm_reqsize,
-        reqlatency->count,
-        reqlatency->min,
-        reqlatency->mean,
-        sm_stat_percentile(reqlatency, 99),
-        reqlatency->max,
-        xferred_tx,
-        (xferred_tx * 8) / (t_elapsed_us),
-        xferred_rx,
-        (xferred_rx * 8) / (t_elapsed_us));
+    if (sm_statsmode == SmStatsModeRegular) {
+
+        printf(
+            "\ncpus: %d\n"
+            "threads: %d\n"
+            "sockets: %d\n"
+            "runtime_ms: %llu\n"
+            "io_bytes: %d\n"
+            "req_bytes: %llu\n"
+            "req_count: %llu\n"
+            "reqlatency_min_us: %llu\n"
+            "reqlatency_avg_us: %llu\n"
+            "reqlatency_p99_us: %llu\n"
+            "reqlatency_max_us: %llu\n"
+            "tx_bytes: %llu\n"
+            "tx_Mbps: %llu\n"
+            "rx_bytes: %llu\n"
+            "rx_Mbps: %llu\n",
+            sm_ncpu,
+            sm_nthread,
+            sm_nsock,
+            t_elapsed_us / 1000,
+            sm_iosize,
+            sm_reqsize,
+            reqlatency->count,
+            reqlatency->min,
+            reqlatency->mean,
+            sm_stat_percentile(reqlatency, 99),
+            reqlatency->max,
+            xferred_tx,
+            (xferred_tx * 8) / (t_elapsed_us),
+            xferred_rx,
+            (xferred_rx * 8) / (t_elapsed_us));
+
+    } else if (sm_statsmode == SmStatsModeHistoReqLatency) {
+
+        if (reqlatency->count > 0) {
+            int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
+            while (reqlatency->buckets[last_nonempty_bucket] == 0) {
+                last_nonempty_bucket--;
+            }
+
+            printf("----------------------------\n"
+                   "  latency_usec :   numreq\n"
+                   "----------------------------\n");
+            for (int i = 0; i <= last_nonempty_bucket; i++) {
+                printf("%7llu-%-7llu:   ",
+                    i * reqlatency->bucket_width,
+                    (i + 1) * reqlatency->bucket_width - 1);
+                printf("%llu\n", reqlatency->buckets[i]);
+            }
+        }
+
+    }
 
     free(reqlatency);
 }
@@ -1334,6 +1364,15 @@ int realmain(int argc, wchar_t** argv)
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-iosize")) {
             sm_iosize = _wtoi(*av);
+            av++; ac++;
+        } else if (argsleft >= 1 && !wcscmp(*name, L"-histo")) {
+            if (!wcscmp(*av, L"reqlatency")) {
+                sm_statsmode = SmStatsModeHistoReqLatency;
+            } else {
+                printf("Invalid -histo type\n");
+                err = ERROR_INVALID_PARAMETER;
+                goto exit;
+            }
             av++; ac++;
         } else if (argsleft >= 2 && !wcscmp(*name, L"-tx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionSend) == NULL) {
