@@ -1385,6 +1385,7 @@ void sm_client(void)
             "threads: %d\n"
             "sockets: %d\n"
             "runtime_ms: %llu\n"
+            "tputperiod_ms: %llu\n"
             "io_bytes: %d\n"
             "\n"
             "req_bytes: %llu\n"
@@ -1406,6 +1407,7 @@ void sm_client(void)
             sm_nthread,
             sm_nsock,
             t_elapsed_us / 1000,
+            sm_tput_period_us / 1000,
             sm_iosize,
             sm_reqsize,
             reqlatency.count,
