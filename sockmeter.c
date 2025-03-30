@@ -79,6 +79,8 @@ REFERENCE:
 "   -histo reqlatency: Print a histogram of request latencies\n" \
 "   -histo tput: Print a histogram of collective throughput across all\n" \
 "                connections as measured every 150ms\n" \
+"   -fullhisto: include empty buckets when printing histogram (they are\n" \
+"               excluded by default for brevity)\n" \
 "\n" \
 "Example:\n" \
 "   sockmeter -svc 30000\n" \
@@ -206,6 +208,7 @@ int sm_nsock = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 SmStatsMode sm_statsmode;
+BOOLEAN sm_full_histo = FALSE;
 ULONG64 sm_tput_period_us = 10000;
 
 // Variables for service only:
@@ -1435,10 +1438,12 @@ void sm_client(void)
                    "  latency_usec :   numreq\n"
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
-                printf("%7llu-%-7llu:   ",
-                    i * reqlatency.bucket_width,
-                    (i + 1) * reqlatency.bucket_width - 1);
-                printf("%llu\n", reqlatency.buckets[i]);
+                if (sm_full_histo || reqlatency.buckets[i] != 0) {
+                    printf("%7llu-%-7llu:   ",
+                        i * reqlatency.bucket_width,
+                        (i + 1) * reqlatency.bucket_width - 1);
+                    printf("%llu\n", reqlatency.buckets[i]);
+                }
             }
         }
 
@@ -1454,10 +1459,12 @@ void sm_client(void)
                    " tput_Mbps_tx  :   count\n"
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
-                printf("%7llu-%-7llu:   ",
-                    i * sm_mon_thread->tput_tx.bucket_width,
-                    (i + 1) * sm_mon_thread->tput_tx.bucket_width - 1);
-                printf("%llu\n", sm_mon_thread->tput_tx.buckets[i]);
+                if (sm_full_histo || sm_mon_thread->tput_tx.buckets[i] != 0) {
+                    printf("%7llu-%-7llu:   ",
+                        i * sm_mon_thread->tput_tx.bucket_width,
+                        (i + 1) * sm_mon_thread->tput_tx.bucket_width - 1);
+                    printf("%llu\n", sm_mon_thread->tput_tx.buckets[i]);
+                }
             }
         }
 
@@ -1471,10 +1478,12 @@ void sm_client(void)
                    " tput_Mbps_tx  :   count\n"
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
-                printf("%7llu-%-7llu:   ",
-                    i * sm_mon_thread->tput_rx.bucket_width,
-                    (i + 1) * sm_mon_thread->tput_rx.bucket_width - 1);
-                printf("%llu\n", sm_mon_thread->tput_rx.buckets[i]);
+                if (sm_full_histo || sm_mon_thread->tput_rx.buckets[i] != 0) {
+                    printf("%7llu-%-7llu:   ",
+                        i * sm_mon_thread->tput_rx.bucket_width,
+                        (i + 1) * sm_mon_thread->tput_rx.bucket_width - 1);
+                    printf("%llu\n", sm_mon_thread->tput_rx.buckets[i]);
+                }
             }
         }
     }
@@ -1577,6 +1586,9 @@ int realmain(int argc, wchar_t** argv)
                 err = ERROR_INVALID_PARAMETER;
                 goto exit;
             }
+            av++; ac++;
+        } else if (!wcscmp(*name, L"-fullhisto")) {
+            sm_full_histo = TRUE;
             av++; ac++;
         } else if (argsleft >= 2 && !wcscmp(*name, L"-tx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionSend) == NULL) {
