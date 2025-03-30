@@ -74,6 +74,8 @@ REFERENCE:
 "   -iosize [#]: Bytes passed in each send/recv (default: 64KB).\n" \
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
+"   -tputperiod [#]: throughput samples for percentile calculations are measured\n" \
+"                     over periods of # milliseconds (default: 10ms).\n" \
 "   -histo reqlatency: Print a histogram of request latencies\n" \
 "   -histo tput: Print a histogram of collective throughput across all\n" \
 "                connections as measured every 150ms\n" \
@@ -162,13 +164,24 @@ typedef struct _SmIoThread {
     ULONG64 xferred_tx_period_start;
     ULONG64 xferred_rx_period_start;
     SmStat tput_tx;
-    SmStat tput_rx; // TODO: initialize
+    SmStat tput_rx;
 
     SmConn* conns;
     ULONG numconns;
     ULONG64 numreqs;
     SmStat reqlatency;
 } SmIoThread;
+
+typedef struct _SmMonThread {
+    HANDLE t;
+    HANDLE done_event;
+
+    ULONG64 tput_period_start_us;
+    ULONG64 xferred_tx_period_start;
+    ULONG64 xferred_rx_period_start;
+    SmStat tput_tx;
+    SmStat tput_rx;
+} SmMonThread;
 
 typedef enum {
     SmStatsModeRegular,
@@ -186,13 +199,14 @@ BOOLEAN svcmode = FALSE;
 int sm_ncpu = 0;
 
 // Variables for client only:
+SmMonThread* sm_mon_thread = NULL;
 SmPeer* sm_peers = NULL;
 ULONG64 sm_reqsize = 16000000;  // 16MB default
 int sm_nsock = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 SmStatsMode sm_statsmode;
-ULONG64 sm_tput_period_us = 150;
+ULONG64 sm_tput_period_us = 10000;
 
 // Variables for service only:
 SERVICE_STATUS_HANDLE sm_svc_status_handle;
@@ -494,6 +508,60 @@ void sm_del_io_thread(SmIoThread* thread)
 
     CloseHandle(thread->t);
     CloseHandle(thread->iocp);
+    free(thread);
+}
+
+SmMonThread* sm_new_mon_thread(LPTHREAD_START_ROUTINE fn)
+{
+    int err = NO_ERROR;
+    SmMonThread* thread = NULL;
+
+    thread = malloc(sizeof(SmMonThread));
+    if (thread == NULL) {
+        printf("Failed to allocate SmMonThread\n");
+        return NULL;
+    }
+    memset(thread, 0, sizeof(*thread));
+
+    thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
+    if (thread->t == NULL) {
+        err = GetLastError();
+        printf("CreateThread failed with %d\n", err);
+        goto exit;
+    }
+
+    thread->done_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (thread->done_event == NULL) {
+        err = GetLastError();
+        printf("CreateEvent failed with %d\n", err);
+        goto exit;
+    }
+
+    thread->tput_period_start_us = sm_curtime_us();
+
+    sm_stat_init(&thread->tput_tx);
+    sm_stat_init(&thread->tput_rx);
+
+exit:
+    if (err != NO_ERROR) {
+        if (thread != NULL) {
+            if (thread->done_event != NULL) {
+                CloseHandle(thread->done_event);
+            }
+            if (thread->t != NULL) {
+                CloseHandle(thread->t);
+            }
+            free(thread);
+            thread = NULL;
+        }
+    }
+    return thread;
+}
+
+void sm_del_mon_thread(SmMonThread* thread)
+{
+    CloseHandle(thread->done_event);
+    CloseHandle(thread->t);
     free(thread);
 }
 
@@ -1177,6 +1245,53 @@ exit:
     return err;
 }
 
+DWORD sm_mon_fn(void* param)
+{
+    SmMonThread* thread = (SmMonThread*)param;
+    int err = NO_ERROR;
+
+    while (TRUE) {
+        err = WaitForSingleObject(thread->done_event, (DWORD)(sm_tput_period_us / 1000));
+        if (err == WAIT_OBJECT_0) {
+            break;
+        } else if (err != WAIT_TIMEOUT) {
+            printf("mon wait on event failed with %d\n", err);
+            break;
+        }
+        err = NO_ERROR;
+
+        ULONG64 curtime = sm_curtime_us();
+        if (curtime > thread->tput_period_start_us) {
+
+            ULONG64 periodtime = curtime - thread->tput_period_start_us;
+
+            ULONG64 xferred_tx = 0;
+            ULONG64 xferred_rx = 0;
+            SmIoThread* io_thread = sm_threads;
+            while (io_thread != NULL) {
+                xferred_tx += io_thread->xferred_tx;
+                xferred_rx += io_thread->xferred_rx;
+                io_thread = io_thread->next;
+            }
+
+            ULONG64 periodbytes_tx =
+                xferred_tx - thread->xferred_tx_period_start;
+            ULONG64 periodbytes_rx =
+                xferred_rx - thread->xferred_rx_period_start;
+
+            sm_stat_add(&thread->tput_tx, periodbytes_tx * 8 / periodtime);
+            sm_stat_add(&thread->tput_rx, periodbytes_rx * 8 / periodtime);
+
+            thread->xferred_tx_period_start = xferred_tx;
+            thread->xferred_rx_period_start = xferred_rx;
+            thread->tput_period_start_us = curtime;
+        }
+
+    }
+
+    return err;
+}
+
 DWORD sm_client_io_fn(void* param)
 {
     SmIoThread* thread = (SmIoThread*)param;
@@ -1195,6 +1310,11 @@ void sm_client(void)
         if (thread == NULL) {
             return;
         }
+    }
+
+    sm_mon_thread = sm_new_mon_thread(sm_mon_fn);
+    if (sm_mon_thread == NULL) {
+        return;
     }
 
     printf("Running... ");
@@ -1231,6 +1351,12 @@ void sm_client(void)
         thread = thread->next;
     }
 
+    if (!SetEvent(sm_mon_thread->done_event)) {
+        err = GetLastError();
+        printf("Setting mon thread event failed with %d\n", err);
+    }
+    WaitForSingleObject(sm_mon_thread->t, INFINITE);
+
     ULONG64 t_end_us = sm_curtime_us();
     ULONG64 t_elapsed_us = t_end_us - t_start_us;
 
@@ -1240,10 +1366,6 @@ void sm_client(void)
     ULONG64 xferred_rx = 0;
     SmStat reqlatency;
     sm_stat_init(&reqlatency);
-    SmStat tput_tx;
-    sm_stat_init(&tput_tx);
-    SmStat tput_rx;
-    sm_stat_init(&tput_rx);
 
     // Merge the per-thread stats.
     thread = sm_threads;
@@ -1254,8 +1376,6 @@ void sm_client(void)
         xferred_tx += thread->xferred_tx;
         xferred_rx += thread->xferred_rx;
         sm_stat_merge(&reqlatency, &thread->reqlatency);
-        sm_stat_merge(&tput_tx, &thread->tput_tx);
-        sm_stat_merge(&tput_rx, &thread->tput_rx);
         thread = thread->next;
     }
 
@@ -1267,20 +1387,22 @@ void sm_client(void)
             "sockets: %d\n"
             "runtime_ms: %llu\n"
             "io_bytes: %d\n"
+            "\n"
             "req_bytes: %llu\n"
             "req_count: %llu\n"
-            "reqlatency_min_us: %llu\n"
-            "reqlatency_avg_us: %llu\n"
-            "reqlatency_p99_us: %llu\n"
-            "reqlatency_max_us: %llu\n"
-            "tx_Mbps_perthread_p90_us: %llu\n"
-            "tx_Mbps_perthread_max_us: %llu\n"
+            "req_latency_min_us: %llu\n"
+            "req_latency_avg_us: %llu\n"
+            "req_latency_p99_us: %llu\n"
+            "req_latency_max_us: %llu\n"
+            "\n"
             "tx_bytes: %llu\n"
-            "tx_Mbps: %llu\n"
-            "rx_Mbps_perthread_p90_us: %llu\n"
-            "rx_Mbps_perthread_max_us: %llu\n"
+            "tx_avg_Mbps: %llu\n"
+            "tx_p99_Mbps: %llu\n"
+            "\n"
             "rx_bytes: %llu\n"
-            "rx_Mbps: %llu\n",
+            "rx_avg_Mbps: %llu\n"
+            "rx_p99_Mbps: %llu\n"
+            ,
             sm_ncpu,
             sm_nthread,
             sm_nsock,
@@ -1292,14 +1414,13 @@ void sm_client(void)
             reqlatency.mean,
             sm_stat_percentile(&reqlatency, 99),
             reqlatency.max,
-            sm_stat_percentile(&tput_tx, 90),
-            tput_tx.max,
             xferred_tx,
             (xferred_tx * 8) / (t_elapsed_us),
-            sm_stat_percentile(&tput_rx, 90),
-            tput_rx.max,
+            sm_stat_percentile(&sm_mon_thread->tput_tx, 99),
             xferred_rx,
-            (xferred_rx * 8) / (t_elapsed_us));
+            (xferred_rx * 8) / (t_elapsed_us),
+            sm_stat_percentile(&sm_mon_thread->tput_rx, 99)
+            );
 
     } else if (sm_statsmode == SmStatsModeHistoReqLatency) {
 
@@ -1322,9 +1443,9 @@ void sm_client(void)
 
     } else if (sm_statsmode == SmStatsModeHistoTput) {
 
-        if (tput_tx.count > 0) {
+        if (sm_mon_thread->tput_tx.count > 0) {
             int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
-            while (tput_tx.buckets[last_nonempty_bucket] == 0) {
+            while (sm_mon_thread->tput_tx.buckets[last_nonempty_bucket] == 0) {
                 last_nonempty_bucket--;
             }
 
@@ -1333,29 +1454,28 @@ void sm_client(void)
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
                 printf("%7llu-%-7llu:   ",
-                    i * tput_tx.bucket_width,
-                    (i + 1) * tput_tx.bucket_width - 1);
-                printf("%llu\n", tput_tx.buckets[i]);
+                    i * sm_mon_thread->tput_tx.bucket_width,
+                    (i + 1) * sm_mon_thread->tput_tx.bucket_width - 1);
+                printf("%llu\n", sm_mon_thread->tput_tx.buckets[i]);
             }
         }
 
-        if (tput_rx.count > 0) {
+        if (sm_mon_thread->tput_rx.count > 0) {
             int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
-            while (tput_rx.buckets[last_nonempty_bucket] == 0) {
+            while (sm_mon_thread->tput_rx.buckets[last_nonempty_bucket] == 0) {
                 last_nonempty_bucket--;
             }
 
             printf("----------------------------\n"
-                   " tput_Mbps_rx  :   count\n"
+                   " tput_Mbps_tx  :   count\n"
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
                 printf("%7llu-%-7llu:   ",
-                    i * tput_rx.bucket_width,
-                    (i + 1) * tput_rx.bucket_width - 1);
-                printf("%llu\n", tput_rx.buckets[i]);
+                    i * sm_mon_thread->tput_rx.bucket_width,
+                    (i + 1) * sm_mon_thread->tput_rx.bucket_width - 1);
+                printf("%llu\n", sm_mon_thread->tput_rx.buckets[i]);
             }
         }
-
     }
 }
 
@@ -1437,6 +1557,9 @@ int realmain(int argc, wchar_t** argv)
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-t")) {
             sm_durationms = _wtoi(*av);
+            av++; ac++;
+        } else if (argsleft >= 1 && !wcscmp(*name, L"-tputperiod")) {
+            sm_tput_period_us = _wtoi(*av) * 1000;
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-sbuf")) {
             sm_sbuf = _wtoi(*av);
