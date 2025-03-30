@@ -75,6 +75,8 @@ REFERENCE:
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
 "   -histo reqlatency: Print a histogram of request latencies\n" \
+"   -histo tput: Print a histogram of collective throughput across all\n" \
+"                connections as measured every 150ms\n" \
 "\n" \
 "Example:\n" \
 "   sockmeter -svc 30000\n" \
@@ -151,8 +153,17 @@ typedef struct _SmIoThread {
     HANDLE t;
     HANDLE iocp;
     CRITICAL_SECTION lock;
-    ULONG64 xferred_tx; // sum of bytes tx'd by completed reqs.
-    ULONG64 xferred_rx; // sum of bytes rx'd by completed reqs.
+
+    // Cumulative bytes transferred by thread
+    ULONG64 xferred_tx;
+    ULONG64 xferred_rx;
+
+    ULONG64 tput_period_start_us;
+    ULONG64 xferred_tx_period_start;
+    ULONG64 xferred_rx_period_start;
+    SmStat tput_tx;
+    SmStat tput_rx; // TODO: initialize
+
     SmConn* conns;
     ULONG numconns;
     ULONG64 numreqs;
@@ -162,6 +173,7 @@ typedef struct _SmIoThread {
 typedef enum {
     SmStatsModeRegular,
     SmStatsModeHistoReqLatency,
+    SmStatsModeHistoTput,
 } SmStatsMode;
 
 // Variables for both client and service:
@@ -180,6 +192,7 @@ int sm_nsock = 1;
 int sm_durationms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 SmStatsMode sm_statsmode;
+ULONG64 sm_tput_period_us = 150;
 
 // Variables for service only:
 SERVICE_STATUS_HANDLE sm_svc_status_handle;
@@ -209,6 +222,13 @@ inline ULONG64 sm_curtime_us(void)
         return 0;
     }
     return ticks * 1000000 / sm_perf_freq;
+}
+
+inline ULONG64 sm_curtime_us_cheap()
+{
+    // This function is less accurate (error on the order of 10ms) but
+    // more efficient than sm_curtime_us.
+    return GetTickCount64() * 1000;
 }
 
 SmPeer* sm_new_peer(wchar_t* host, wchar_t* port, SmDirection dir)
@@ -426,6 +446,8 @@ SmIoThread* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
     thread->numconns = 0;
     thread->conns = NULL;
     sm_stat_init(&thread->reqlatency);
+    sm_stat_init(&thread->tput_tx);
+    sm_stat_init(&thread->tput_rx);
 
     thread->t = CreateThread(NULL, 0, fn, (void*)thread, 0, NULL);
     if (thread->t == NULL) {
@@ -672,8 +694,6 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
                 // Record stats for this request.
                 ULONG64 latency = sm_curtime_us() - conn->req_start_us;
                 sm_stat_add(&thread->reqlatency, latency);
-                thread->xferred_tx += conn->xferred_tx;
-                thread->xferred_rx += conn->xferred_rx;
             }
 
             conn->xferred_tx = 0;
@@ -760,8 +780,35 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
             ULONG64* conn_dir_xferred;
             if (io->dir == SmDirectionSend) {
                 conn_dir_xferred = &conn->xferred_tx;
+                thread->xferred_tx += xferred;
             } else {
                 conn_dir_xferred = &conn->xferred_rx;
+                thread->xferred_rx += xferred;
+            }
+
+            ULONG64 curtime_imprecise = sm_curtime_us_cheap();
+            if (curtime_imprecise > thread->tput_period_start_us &&
+                curtime_imprecise - thread->tput_period_start_us >
+                    sm_tput_period_us) {
+
+                ULONG64 curtime = sm_curtime_us();
+                if (curtime > thread->tput_period_start_us) {
+
+                    ULONG64 periodtime = curtime - thread->tput_period_start_us;
+
+                    ULONG64 periodbytes_tx =
+                        thread->xferred_tx - thread->xferred_tx_period_start;
+                    ULONG64 periodbytes_rx =
+                        thread->xferred_rx - thread->xferred_rx_period_start;
+
+                    thread->xferred_tx_period_start = thread->xferred_tx;
+                    thread->xferred_rx_period_start = thread->xferred_rx;
+
+                    sm_stat_add(&thread->tput_tx, periodbytes_tx * 8 / periodtime);
+                    sm_stat_add(&thread->tput_rx, periodbytes_rx * 8 / periodtime);
+
+                    thread->tput_period_start_us = curtime;
+                }
             }
 
             io->xferred += xferred;
@@ -1132,7 +1179,9 @@ exit:
 
 DWORD sm_client_io_fn(void* param)
 {
-    return sm_io_loop((SmIoThread*)param, 5000);
+    SmIoThread* thread = (SmIoThread*)param;
+    thread->tput_period_start_us = sm_curtime_us();
+    return sm_io_loop(thread, 5000);
 }
 
 void sm_client(void)
@@ -1189,12 +1238,12 @@ void sm_client(void)
 
     ULONG64 xferred_tx = 0;
     ULONG64 xferred_rx = 0;
-    SmStat* reqlatency = malloc(sizeof(SmStat));
-    if (reqlatency == NULL) {
-        printf("Failed to allocate memory for calculating stats!\n");
-        return;
-    }
-    sm_stat_init(reqlatency);
+    SmStat reqlatency;
+    sm_stat_init(&reqlatency);
+    SmStat tput_tx;
+    sm_stat_init(&tput_tx);
+    SmStat tput_rx;
+    sm_stat_init(&tput_rx);
 
     // Merge the per-thread stats.
     thread = sm_threads;
@@ -1204,7 +1253,9 @@ void sm_client(void)
         }
         xferred_tx += thread->xferred_tx;
         xferred_rx += thread->xferred_rx;
-        sm_stat_merge(reqlatency, &thread->reqlatency);
+        sm_stat_merge(&reqlatency, &thread->reqlatency);
+        sm_stat_merge(&tput_tx, &thread->tput_tx);
+        sm_stat_merge(&tput_rx, &thread->tput_rx);
         thread = thread->next;
     }
 
@@ -1222,8 +1273,12 @@ void sm_client(void)
             "reqlatency_avg_us: %llu\n"
             "reqlatency_p99_us: %llu\n"
             "reqlatency_max_us: %llu\n"
+            "tx_Mbps_perthread_p90_us: %llu\n"
+            "tx_Mbps_perthread_max_us: %llu\n"
             "tx_bytes: %llu\n"
             "tx_Mbps: %llu\n"
+            "rx_Mbps_perthread_p90_us: %llu\n"
+            "rx_Mbps_perthread_max_us: %llu\n"
             "rx_bytes: %llu\n"
             "rx_Mbps: %llu\n",
             sm_ncpu,
@@ -1232,21 +1287,25 @@ void sm_client(void)
             t_elapsed_us / 1000,
             sm_iosize,
             sm_reqsize,
-            reqlatency->count,
-            reqlatency->min,
-            reqlatency->mean,
-            sm_stat_percentile(reqlatency, 99),
-            reqlatency->max,
+            reqlatency.count,
+            reqlatency.min,
+            reqlatency.mean,
+            sm_stat_percentile(&reqlatency, 99),
+            reqlatency.max,
+            sm_stat_percentile(&tput_tx, 90),
+            tput_tx.max,
             xferred_tx,
             (xferred_tx * 8) / (t_elapsed_us),
+            sm_stat_percentile(&tput_rx, 90),
+            tput_rx.max,
             xferred_rx,
             (xferred_rx * 8) / (t_elapsed_us));
 
     } else if (sm_statsmode == SmStatsModeHistoReqLatency) {
 
-        if (reqlatency->count > 0) {
+        if (reqlatency.count > 0) {
             int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
-            while (reqlatency->buckets[last_nonempty_bucket] == 0) {
+            while (reqlatency.buckets[last_nonempty_bucket] == 0) {
                 last_nonempty_bucket--;
             }
 
@@ -1255,15 +1314,49 @@ void sm_client(void)
                    "----------------------------\n");
             for (int i = 0; i <= last_nonempty_bucket; i++) {
                 printf("%7llu-%-7llu:   ",
-                    i * reqlatency->bucket_width,
-                    (i + 1) * reqlatency->bucket_width - 1);
-                printf("%llu\n", reqlatency->buckets[i]);
+                    i * reqlatency.bucket_width,
+                    (i + 1) * reqlatency.bucket_width - 1);
+                printf("%llu\n", reqlatency.buckets[i]);
+            }
+        }
+
+    } else if (sm_statsmode == SmStatsModeHistoTput) {
+
+        if (tput_tx.count > 0) {
+            int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
+            while (tput_tx.buckets[last_nonempty_bucket] == 0) {
+                last_nonempty_bucket--;
+            }
+
+            printf("----------------------------\n"
+                   " tput_Mbps_tx  :   count\n"
+                   "----------------------------\n");
+            for (int i = 0; i <= last_nonempty_bucket; i++) {
+                printf("%7llu-%-7llu:   ",
+                    i * tput_tx.bucket_width,
+                    (i + 1) * tput_tx.bucket_width - 1);
+                printf("%llu\n", tput_tx.buckets[i]);
+            }
+        }
+
+        if (tput_rx.count > 0) {
+            int last_nonempty_bucket = SM_HISTO_NUM_BUCKETS - 1;
+            while (tput_rx.buckets[last_nonempty_bucket] == 0) {
+                last_nonempty_bucket--;
+            }
+
+            printf("----------------------------\n"
+                   " tput_Mbps_rx  :   count\n"
+                   "----------------------------\n");
+            for (int i = 0; i <= last_nonempty_bucket; i++) {
+                printf("%7llu-%-7llu:   ",
+                    i * tput_rx.bucket_width,
+                    (i + 1) * tput_rx.bucket_width - 1);
+                printf("%llu\n", tput_rx.buckets[i]);
             }
         }
 
     }
-
-    free(reqlatency);
 }
 
 int realmain(int argc, wchar_t** argv)
@@ -1357,6 +1450,8 @@ int realmain(int argc, wchar_t** argv)
         } else if (argsleft >= 1 && !wcscmp(*name, L"-histo")) {
             if (!wcscmp(*av, L"reqlatency")) {
                 sm_statsmode = SmStatsModeHistoReqLatency;
+            } else if (!wcscmp(*av, L"tput")) {
+                sm_statsmode = SmStatsModeHistoTput;
             } else {
                 printf("Invalid -histo type\n");
                 err = ERROR_INVALID_PARAMETER;

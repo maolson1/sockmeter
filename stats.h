@@ -33,8 +33,10 @@ inline void sm_mean_merge(
     // Merge two means, recording the output into "to" and "to_n".
     // "to" is a mean of "to_n" values; "from" is a mean of "from_n" values.
 
-    *to = (*to * *to_n + from * from_n) / (*to_n + from_n);
-    *to_n += from_n;
+    if (from_n > 0) {
+        *to = (*to * *to_n + from * from_n) / (*to_n + from_n);
+        *to_n += from_n;
+    }
 }
 
 inline void sm_stat_init(SmStat* s)
