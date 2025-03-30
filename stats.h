@@ -7,8 +7,8 @@
 // [ bucket_width*i,   bucket_width*(i+1) ).
 //
 // If a new value is sampled that cannot be encoded by the
-// histogram (the max encodable value is num_buckets * bucket_size),
-// the bucket size is repeatedly doubled and existing counts
+// histogram (the max encodable value is num_buckets * bucket_width),
+// the bucket width is repeatedly doubled and existing counts
 // reshuffled until the new value is encodable.
 //
 // This gives percentile estimates accurate to within a few percent
