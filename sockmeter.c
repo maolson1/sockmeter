@@ -1362,12 +1362,11 @@ void sm_client(void)
 
     printf("Finished.\n");
 
+    // Merge thread stats.
     ULONG64 xferred_tx = 0;
     ULONG64 xferred_rx = 0;
     SmStat reqlatency;
     sm_stat_init(&reqlatency);
-
-    // Merge the per-thread stats.
     thread = sm_threads;
     while (thread != NULL) {
         if (thread->conns != NULL) {
@@ -1495,14 +1494,10 @@ int realmain(int argc, wchar_t** argv)
         goto exit;
     }
 
-    {
-        // Get info on the CPU. Here we use GetLogicalProcessorInformationEx
+    {   // Get info on the CPU. Here we use GetLogicalProcessorInformationEx
         // instead of GetSystemInfo so we can get a full count of logical
         // processors rather than just the count of logical processors in
         // sockmeter's assigned processor group.
-        //
-        // TODO: use RelationNumaNodeEx and build a list of nodes rather than
-        // just counting the processors.
         DWORD cpuinfo_len = 0;
         GetLogicalProcessorInformationEx(RelationGroup, NULL, &cpuinfo_len);
         SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX* cpuinfo = malloc(cpuinfo_len);
@@ -1669,25 +1664,59 @@ exit:
 
 int sm_start_svc(int argc, wchar_t** argv)
 {
-    // NB: assumes argc == 3
-
     int err = NO_ERROR;
     SC_HANDLE svc_handle = NULL;
     SC_HANDLE scm_handle = NULL;
     SERVICE_STATUS svc_status = {0};
-    // args for starting the service are "-svc [p]"; change this to the
-    // args expected by the service: "-svclisten [p]".
     wchar_t abspath[MAX_PATH + 2];
-    wchar_t* modified_argv[3] = {abspath, L"-svclisten", argv[2]};
-    wchar_t* cmdline = NULL;
+    wchar_t** argv_cooked = NULL;
+    int argc_cooked = 0;
+    wchar_t* argv_serial = NULL;
 
-    abspath[0] = L'\"'; // wrap in quotes in case of spaces in path.
-    if (!GetModuleFileName(NULL, abspath + 1, MAX_PATH)) {
-        err = GetLastError();
-        printf("GetModuleFileName failed with %d\n", err);
-        goto exit;
+    {   // Get absolute path to .exe, wrapped in quotes.
+        abspath[0] = L'\"';
+        if (!GetModuleFileName(NULL, abspath + 1, MAX_PATH)) {
+            err = GetLastError();
+            printf("GetModuleFileName failed with %d\n", err);
+            goto exit;
+        }
+        wcscat_s(abspath, MAX_PATH + 2, L"\"");
     }
-    wcscat_s(abspath, MAX_PATH + 2, L"\"");
+
+    {   // Cook args:
+        // -replace argv[0] with abspath.
+        // -replace "-svc" in argv[1] with "-svclisten".
+        argv_cooked = malloc(sizeof(wchar_t*) * argc);
+        if (argv_cooked == NULL) {
+            printf("out of memory\n");
+            goto exit;
+        }
+        argv_cooked[0] = abspath;
+        argv_cooked[1] = L"-svclisten";
+        for (int i = 2; i < argc; i++) {
+            argv_cooked[i] = argv[i];
+        }
+        argc_cooked = argc;
+    }
+
+    {   // Serialize args for CreateService.
+        size_t argv_serial_len = 0;
+        for (int i = 0; i < argc_cooked; i++) {
+            argv_serial_len += wcslen(argv_cooked[i]) + 1;
+        }
+        argv_serial = malloc(argv_serial_len * sizeof(wchar_t));
+        if (argv_serial == NULL) {
+            printf("Could not allocate cmdline for CreateService\n");
+            err = ERROR_NOT_ENOUGH_MEMORY;
+            goto exit;
+        }
+        argv_serial[0] = L'\0';
+        for (int i = 0; i < argc - 1; i++) {
+            wcscat_s(argv_serial, argv_serial_len, argv_cooked[i]);
+            wcscat_s(argv_serial, argv_serial_len, L" ");
+        }
+        wcscat_s(argv_serial, argv_serial_len, argv_cooked[argc_cooked - 1]);
+    }
 
     scm_handle = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (scm_handle == NULL) {
@@ -1704,30 +1733,10 @@ int sm_start_svc(int argc, wchar_t** argv)
     if (svc_handle == NULL) {
         err = GetLastError();
         if (err == ERROR_SERVICE_DOES_NOT_EXIST) {
-
-            // NB- this cmdline is used for autostart. For demand start
-            // the args passed to StartService are used instead.
-            size_t cmdline_len = 0;
-            for (int i = 0; i < argc; i++) {
-                cmdline_len += wcslen(modified_argv[i]) + 1;
-            }
-            cmdline = malloc(cmdline_len * sizeof(wchar_t));
-            if (cmdline == NULL) {
-                printf("Could not allocate cmdline for CreateService\n");
-                err = ERROR_NOT_ENOUGH_MEMORY;
-                goto exit;
-            }
-            cmdline[0] = L'\0';
-            for (int i = 0; i < argc - 1; i++) {
-                wcscat_s(cmdline, cmdline_len, modified_argv[i]);
-                wcscat_s(cmdline, cmdline_len, L" ");
-            }
-            wcscat_s(cmdline, cmdline_len, modified_argv[argc - 1]);
-
             svc_handle = CreateService(
                 scm_handle, SM_SERVICE_NAME, SM_SERVICE_NAME,
                 SERVICE_ALL_ACCESS, SERVICE_WIN32_OWN_PROCESS,
-                SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, cmdline,
+                SERVICE_AUTO_START, SERVICE_ERROR_NORMAL, argv_serial,
                 NULL, NULL, NULL, L"NT AUTHORITY\\LocalService", NULL);
             if (svc_handle == NULL) {
                 err = GetLastError();
@@ -1748,7 +1757,7 @@ int sm_start_svc(int argc, wchar_t** argv)
 
     if (svc_status.dwCurrentState == SERVICE_STOPPED) {
         printf("Starting service.\n");
-        if (!StartService(svc_handle, argc - 1, modified_argv + 1)) {
+        if (!StartService(svc_handle, argc_cooked, argv_cooked)) {
             err = GetLastError();
             printf("StartService failed with %d\n", err);
             goto exit;
@@ -1761,8 +1770,11 @@ int sm_start_svc(int argc, wchar_t** argv)
     }
 
 exit:
-    if (cmdline != NULL) {
-        free(cmdline);
+    if (argv_cooked != NULL) {
+        free(argv_cooked);
+    }
+    if (argv_serial != NULL) {
+        free(argv_serial);
     }
     if (svc_handle != NULL) {
         CloseServiceHandle(svc_handle);
