@@ -108,7 +108,7 @@ typedef struct {
     ULONG64 to_xfer;
 } SmRequest;
 typedef struct {
-#define RESP_UNUSED_VALUE 13
+#define SM_RESPONSE_UNUSED_VALUE 13
     ULONG64 unused;
 } SmResponse;
 #pragma pack(pop)
@@ -192,7 +192,7 @@ typedef enum {
 } SmStatsMode;
 
 // Variables for both client and service:
-SmIoThread* sm_threads = NULL;
+SmIoThread* sm_io_threads = NULL;
 int sm_nthread = 1;
 int sm_iosize = 65535;  // 64KB default
 int sm_sbuf = -1;
@@ -205,7 +205,7 @@ SmMonThread* sm_mon_thread = NULL;
 SmPeer* sm_peers = NULL;
 ULONG64 sm_reqsize = 16000000;  // 16MB default
 int sm_nsock = 1;
-int sm_durationms = 0;
+int sm_duration_ms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 SmStatsMode sm_statsmode;
 BOOLEAN sm_full_histo = FALSE;
@@ -473,8 +473,8 @@ SmIoThread* sm_new_io_thread(LPTHREAD_START_ROUTINE fn)
         goto exit;
     }
 
-    thread->next = sm_threads;
-    sm_threads = thread;
+    thread->next = sm_io_threads;
+    sm_io_threads = thread;
 
 exit:
     if (err != NO_ERROR) {
@@ -497,14 +497,14 @@ void sm_del_io_thread(SmIoThread* thread)
     // This is called from the main thread on termination, and we assume
     // the SmIoThread's thread is already terminated.
 
-    SmIoThread** t = &sm_threads;
+    SmIoThread** t = &sm_io_threads;
     while (*t != thread) {
         t = &((*t)->next);
     }
     *t = thread->next;
 
-    // Normally conns are deleted as they finish, but if there's an error
-    // we may terminate early and still have some conns to delete here.
+    // Normally connections are deleted as they finish, but if there's an error
+    // we may terminate early and still have some connections to delete here.
     while (thread->conns != NULL) {
         sm_del_conn(thread, thread->conns);
     }
@@ -577,9 +577,8 @@ int sm_send(SmConn* conn, int offset, int numbytes)
     conn->io_tx->wsabuf.buf = conn->io_tx->buf + offset;
     conn->io_tx->wsabuf.len = numbytes;
 
-    if (WSASend(
-            conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
-            0, &(conn->io_tx->ov), NULL) == SOCKET_ERROR) {
+    if (WSASend(conn->sock, &(conn->io_tx->wsabuf), 1, NULL,
+                0, &(conn->io_tx->ov), NULL) == SOCKET_ERROR) {
         err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
             printf("WSASend failed with %d\n", err);
@@ -603,10 +602,9 @@ int sm_recv(SmConn* conn, int offset, int numbytes, int recvflags)
     conn->io_rx->wsabuf.len = numbytes;
     conn->io_rx->recvflags = recvflags;
 
-    if (WSARecv(
-            conn->sock, &(conn->io_rx->wsabuf), 1, NULL,
-            &(conn->io_rx->recvflags), &(conn->io_rx->ov), NULL)
-                == SOCKET_ERROR) {
+    if (WSARecv(conn->sock, &(conn->io_rx->wsabuf), 1, NULL,
+                &(conn->io_rx->recvflags), &(conn->io_rx->ov), NULL)
+                    == SOCKET_ERROR) {
         err = WSAGetLastError();
         if (err != WSA_IO_PENDING) {
             printf("WSARecv failed with %d\n", err);
@@ -620,11 +618,11 @@ exit:
     return err;
 }
 
-int sm_issue_req(SmConn* conn)
+int sm_send_request(SmConn* conn)
 {
     int err = NO_ERROR;
 
-    DEVTRACE("issue req\n");
+    DEVTRACE("send request\n");
 
     SmRequest* req = (SmRequest*)conn->io_tx->buf;
     switch (conn->dir) {
@@ -665,11 +663,11 @@ exit:
     return err;
 }
 
-int sm_recv_req(SmConn* conn)
+int sm_recv_request(SmConn* conn)
 {
     int err = NO_ERROR;
 
-    DEVTRACE("issue recv for req\n");
+    DEVTRACE("recv request\n");
 
     conn->io_rx->to_xfer = sizeof(SmRequest);
     err = sm_recv(conn, 0, sizeof(SmRequest), MSG_WAITALL);
@@ -681,14 +679,14 @@ exit:
     return err;
 }
 
-int sm_issue_resp(SmConn* conn)
+int sm_send_response(SmConn* conn)
 {
     int err = NO_ERROR;
 
-    DEVTRACE("issue response\n");
+    DEVTRACE("send response\n");
 
     SmResponse* resp = (SmResponse*)conn->io_tx->buf;
-    resp->unused = RESP_UNUSED_VALUE;
+    resp->unused = SM_RESPONSE_UNUSED_VALUE;
 
     conn->io_tx->to_xfer = sizeof(SmResponse);
     err = sm_send(conn, 0, sizeof(SmResponse));
@@ -700,11 +698,11 @@ exit:
     return err;
 }
 
-int sm_recv_resp(SmConn* conn)
+int sm_recv_response(SmConn* conn)
 {
     int err = NO_ERROR;
 
-    DEVTRACE("issue recv for response\n");
+    DEVTRACE("recv response\n");
 
     conn->io_rx->to_xfer = sizeof(SmResponse);
     err = sm_recv(conn, 0, sizeof(SmResponse), MSG_WAITALL);
@@ -772,19 +770,19 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
 
             // Shut down or do the next request.
 
-            if (sm_cleanup_time || (!svcmode && sm_durationms == 0)) {
+            if (sm_cleanup_time || (!svcmode && sm_duration_ms == 0)) {
                 DEVTRACE("shutting down conn\n");
                 shutdown(conn->sock, SD_BOTH);
                 sm_del_conn(thread, conn);
             } else {
                 io->xferred = 0;
                 if (svcmode) {
-                    err = sm_recv_req(conn);
+                    err = sm_recv_request(conn);
                     if (err != NO_ERROR) {
                         goto exit;
                     }
                 } else {
-                    err = sm_issue_req(conn);
+                    err = sm_send_request(conn);
                     if (err != NO_ERROR) {
                         goto exit;
                     }
@@ -807,7 +805,7 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
                     goto exit;
                 }
             }
-            // NB: We post the initial recv in sm_issue_req, so no need to post
+            // NB: We post the initial recv in sm_send_request, so no need to post
             // it here.
 
         } else if (svcmode &&
@@ -933,12 +931,12 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
                     conn->state = SmConnStateResponse;
 
                     if (svcmode) {
-                        err = sm_issue_resp(conn);
+                        err = sm_send_response(conn);
                         if (err != NO_ERROR) {
                             goto exit;
                         }
                     } else {
-                        err = sm_recv_resp(conn);
+                        err = sm_recv_response(conn);
                         if (err != NO_ERROR) {
                             goto exit;
                         }
@@ -1026,7 +1024,7 @@ int sm_connect_conn(SmIoThread* thread, SmPeer* peer)
         goto exit;
     }
 
-    err = sm_issue_req(conn);
+    err = sm_send_request(conn);
     if (err != NO_ERROR) {
         printf("failed to send req\n");
         goto exit;
@@ -1101,7 +1099,7 @@ SmConn* sm_accept_conn(SOCKET ls, SmIoThread* thread)
     }
     ss = INVALID_SOCKET; // conn owns socket now.
 
-    err = sm_recv_req(conn);
+    err = sm_recv_request(conn);
     if (err != 0) {
         printf("failed to issue recv for req\n");
         goto exit;
@@ -1225,7 +1223,7 @@ DWORD sm_service(void* param)
         "listenport: %d\n",
         sm_ncpu, sm_nthread, ntohs(SS_PORT(&sm_svcaddr)));
 
-    thread = sm_threads;
+    thread = sm_io_threads;
     while (TRUE) {
         SmConn* conn = sm_accept_conn(ls, thread);
         if (conn == NULL) {
@@ -1233,7 +1231,7 @@ DWORD sm_service(void* param)
         }
         thread = thread->next;
         if (thread == NULL) {
-            thread = sm_threads;
+            thread = sm_io_threads;
         }
     }
 
@@ -1270,7 +1268,7 @@ DWORD sm_mon_fn(void* param)
 
             ULONG64 xferred_tx = 0;
             ULONG64 xferred_rx = 0;
-            SmIoThread* io_thread = sm_threads;
+            SmIoThread* io_thread = sm_io_threads;
             while (io_thread != NULL) {
                 xferred_tx += io_thread->xferred_tx;
                 xferred_rx += io_thread->xferred_rx;
@@ -1326,7 +1324,7 @@ void sm_client(void)
 
     // Assign conns to threads and peers round-robin.
 
-    thread = sm_threads;
+    thread = sm_io_threads;
     peer = sm_peers;
     for (int i = 0; i < sm_nsock; i++) {
         err = sm_connect_conn(thread, peer);
@@ -1335,7 +1333,7 @@ void sm_client(void)
         }
         thread = thread->next;
         if (thread == NULL) {
-            thread = sm_threads;
+            thread = sm_io_threads;
         }
         peer = peer->next;
         if (peer == NULL) {
@@ -1343,12 +1341,12 @@ void sm_client(void)
         }
     }
 
-    if (sm_durationms > 0) {
-        err = SleepEx(sm_durationms, FALSE);
+    if (sm_duration_ms > 0) {
+        err = SleepEx(sm_duration_ms, FALSE);
         sm_cleanup_time = TRUE;
     }
 
-    thread = sm_threads;
+    thread = sm_io_threads;
     while (thread != NULL) {
         WaitForSingleObject(thread->t, INFINITE);
         thread = thread->next;
@@ -1370,7 +1368,7 @@ void sm_client(void)
     ULONG64 xferred_rx = 0;
     SmStat reqlatency;
     sm_stat_init(&reqlatency);
-    thread = sm_threads;
+    thread = sm_io_threads;
     while (thread != NULL) {
         if (thread->conns != NULL) {
             printf("unexpected: thread still has active conns\n");
@@ -1562,7 +1560,7 @@ int realmain(int argc, wchar_t** argv)
             sm_reqsize = _wtoi64(*av);
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-t")) {
-            sm_durationms = _wtoi(*av);
+            sm_duration_ms = _wtoi(*av);
             av++; ac++;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-tputperiod")) {
             sm_tput_period_us = _wtoi(*av) * 1000;
@@ -1661,8 +1659,8 @@ int realmain(int argc, wchar_t** argv)
     }
 
 exit:
-    while (sm_threads != NULL) {
-        sm_del_io_thread(sm_threads);
+    while (sm_io_threads != NULL) {
+        sm_del_io_thread(sm_io_threads);
     }
 
     while (sm_peers != NULL) {
