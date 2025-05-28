@@ -170,6 +170,7 @@ typedef struct _SmIoThread {
 
     SmConn* conns;
     ULONG numconns;
+    BOOLEAN at_least_one_connected;
     ULONG64 numreqs;
     SmStat reqlatency;
 } SmIoThread;
@@ -735,9 +736,19 @@ int sm_io_loop(SmIoThread* thread, ULONG timeout_ms)
         if (!GetQueuedCompletionStatus(
                 thread->iocp, (DWORD*)&xferred, (ULONG_PTR*)&conn,
                 (LPOVERLAPPED*)&io, timeout_ms)) {
-            err = GetLastError();
-            printf("GetQueuedCompletionStatus failed with %d\n", err);
-            goto exit;
+
+            if (thread->at_least_one_connected) {
+                err = GetLastError();
+                printf("GetQueuedCompletionStatus failed with %d\n", err);
+                goto exit;
+            } else {
+                // TODO: client timeout is shorter than the connect
+                // timeout, which means if the connect takes longer
+                // than the client timeout we could get here.
+                // Probably we want to shorten the connect timeout,
+                // in which case this codepath can go away.
+                continue;
+            }
         }
 
         DEVTRACE("%s compl %d bytes\n",
@@ -1023,6 +1034,8 @@ int sm_connect_conn(SmIoThread* thread, SmPeer* peer)
         printf("connect failed with %d\n", err);
         goto exit;
     }
+
+    thread->at_least_one_connected = TRUE;
 
     err = sm_send_request(conn);
     if (err != NO_ERROR) {
@@ -1318,7 +1331,7 @@ void sm_client(void)
         return;
     }
 
-    printf("Running... ");
+    printf("Running...\n");
 
     ULONG64 t_start_us = sm_curtime_us();
 
