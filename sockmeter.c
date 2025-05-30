@@ -1615,7 +1615,6 @@ int realmain(int argc, wchar_t** argv)
             av++; ac++;
         } else if (!wcscmp(*name, L"-fullhisto")) {
             sm_full_histo = TRUE;
-            av++; ac++;
         } else if (argsleft >= 2 && !wcscmp(*name, L"-tx")) {
             if (sm_new_peer(*av, *(av + 1), SmDirectionSend) == NULL) {
                 printf("Failed to parse \"-tx %ls %ls\"\n", *av, *(av + 1));
