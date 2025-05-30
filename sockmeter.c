@@ -75,7 +75,8 @@ REFERENCE:
 "   -sbuf [#]: Set SO_SNDBUF to [#] on each socket (default: not set).\n" \
 "   -rbuf [#]: Set SO_RCVBUF to [#] on each socket (default: not set).\n" \
 "   -tputperiod [#]: throughput samples for percentile calculations are measured\n" \
-"                     over periods of # milliseconds (default: 10ms).\n" \
+"                     over periods of # milliseconds (default: 500ms).\n" \
+"   -periodic_print: print the throughput every [tputperiod] milliseconds.\n" \
 "   -histo reqlatency: Print a histogram of request latencies\n" \
 "   -histo tput: Print a histogram of collective throughput across all\n" \
 "                connections as measured every 150ms\n" \
@@ -210,7 +211,8 @@ int sm_duration_ms = 0;
 BOOLEAN sm_cleanup_time = FALSE;
 SmStatsMode sm_statsmode;
 BOOLEAN sm_full_histo = FALSE;
-ULONG64 sm_tput_period_us = 10000;
+ULONG64 sm_tput_period_us = 500000;
+BOOLEAN sm_periodic_print = FALSE;
 
 // Variables for service only:
 SERVICE_STATUS_HANDLE sm_svc_status_handle;
@@ -1263,9 +1265,11 @@ DWORD sm_mon_fn(void* param)
 {
     SmMonThread* thread = (SmMonThread*)param;
     int err = NO_ERROR;
+    ULONG64 start_time = sm_curtime_us();
 
     while (TRUE) {
-        err = WaitForSingleObject(thread->done_event, (DWORD)(sm_tput_period_us / 1000));
+        err = WaitForSingleObject(
+            thread->done_event, (DWORD)(sm_tput_period_us / 1000));
         if (err == WAIT_OBJECT_0) {
             break;
         } else if (err != WAIT_TIMEOUT) {
@@ -1292,9 +1296,18 @@ DWORD sm_mon_fn(void* param)
                 xferred_tx - thread->xferred_tx_period_start;
             ULONG64 periodbytes_rx =
                 xferred_rx - thread->xferred_rx_period_start;
+            ULONG64 rate_tx = periodbytes_tx * 8 / periodtime;
+            ULONG64 rate_rx = periodbytes_rx * 8 / periodtime;
 
-            sm_stat_add(&thread->tput_tx, periodbytes_tx * 8 / periodtime);
-            sm_stat_add(&thread->tput_rx, periodbytes_rx * 8 / periodtime);
+            sm_stat_add(&thread->tput_tx, rate_tx);
+            sm_stat_add(&thread->tput_rx, rate_rx);
+
+            if (sm_periodic_print) {
+                printf("%llu ms  |  TX %llu Mbps  |  RX %llu Mbps\n",
+                    (curtime - start_time) / 1000,
+                    periodbytes_tx * 8 / periodtime,
+                    periodbytes_rx * 8 / periodtime);
+            }
 
             thread->xferred_tx_period_start = xferred_tx;
             thread->xferred_rx_period_start = xferred_rx;
@@ -1578,6 +1591,8 @@ int realmain(int argc, wchar_t** argv)
         } else if (argsleft >= 1 && !wcscmp(*name, L"-tputperiod")) {
             sm_tput_period_us = _wtoi(*av) * 1000;
             av++; ac++;
+        } else if (!wcscmp(*name, L"-periodic_print")) {
+            sm_periodic_print = TRUE;
         } else if (argsleft >= 1 && !wcscmp(*name, L"-sbuf")) {
             sm_sbuf = _wtoi(*av);
             av++; ac++;
