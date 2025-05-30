@@ -38,7 +38,7 @@ REFERENCE:
 #include <iphlpapi.h>
 #include <shellapi.h>
 
-#define VERSION "3.3.0"
+#define VERSION "3.4.0"
 
 #define USAGE \
 "\nsockmeter version " VERSION "\n" \
